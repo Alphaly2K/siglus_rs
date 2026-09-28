@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 
-use std::collections::HashMap;
+use crate::runtime::globals::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -510,7 +510,7 @@ fn env_flag_true(name: &str) -> bool {
 
 fn sg_debug_enabled_local() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("SG_DEBUG").is_some())
+    *ENABLED.get_or_init(|| env_is_set!("SG_DEBUG"))
 }
 
 fn config_button_trace_enabled_local() -> bool {
@@ -520,7 +520,7 @@ fn config_button_trace_enabled_local() -> bool {
 
 fn sg_title_hit_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("SG_TITLE_HIT_TRACE").is_some())
+    *ENABLED.get_or_init(|| env_is_set!("SG_TITLE_HIT_TRACE"))
 }
 
 fn trace_object_slot_enabled(slot: usize) -> bool {
@@ -3857,14 +3857,18 @@ fn dispatch_embedded_object_child_item_op(
     }
     parent.runtime.child_objects[child_u].used = true;
 
-    let prev_chain = ctx.globals.current_object_chain.clone();
     let prev_stage_object = ctx.globals.current_stage_object;
-    if let Some(mut prefix) = parent_prefix {
-        prefix.push(crate::runtime::forms::codes::elm_value::OBJECT_CHILD);
-        prefix.push(ctx.ids.elm_array);
-        prefix.push(child_u as i32);
-        ctx.globals.current_object_chain = Some(prefix);
-    }
+    let prev_chain = match parent_prefix {
+        Some(mut prefix) => {
+            prefix.extend([
+                crate::runtime::forms::codes::elm_value::OBJECT_CHILD,
+                ctx.ids.elm_array,
+                child_u as i32,
+            ]);
+            ctx.globals.current_object_chain.replace(prefix)
+        }
+        None => ctx.globals.current_object_chain.clone(),
+    };
     ctx.globals.current_stage_object = Some((stage_idx, child_runtime_slot));
 
     sg_mwnd_object_trace!(
@@ -3907,7 +3911,10 @@ fn dispatch_embedded_object_child_item_op(
         )
     };
 
-    ctx.globals.current_object_chain = prev_chain;
+    // The chain being replaced is recycled (see `IntVecPool`).
+    if let Some(used) = std::mem::replace(&mut ctx.globals.current_object_chain, prev_chain) {
+        ctx.int_vec_pool.give(used);
+    }
     ctx.globals.current_stage_object = prev_stage_object;
 
     let child_after = &mut parent.runtime.child_objects[child_u];
@@ -4048,11 +4055,11 @@ fn dispatch_embedded_object_item_op(
             None
         };
 
-    let prev_chain = ctx.globals.current_object_chain.clone();
     let prev_stage_object = ctx.globals.current_stage_object;
-    if let Some(prefix) = element_prefix {
-        ctx.globals.current_object_chain = Some(prefix);
-    }
+    let prev_chain = match element_prefix {
+        Some(prefix) => ctx.globals.current_object_chain.replace(prefix),
+        None => ctx.globals.current_object_chain.clone(),
+    };
     ctx.globals.current_stage_object = Some((stage_idx, runtime_slot));
 
     let handled = {
@@ -4097,7 +4104,10 @@ fn dispatch_embedded_object_item_op(
         ctx.globals.current_stage_object
     );
 
-    ctx.globals.current_object_chain = prev_chain;
+    // The chain being replaced is recycled (see `IntVecPool`).
+    if let Some(used) = std::mem::replace(&mut ctx.globals.current_object_chain, prev_chain) {
+        ctx.int_vec_pool.give(used);
+    }
     ctx.globals.current_stage_object = prev_stage_object;
 
     if let Some(slot) = original_nested_runtime_slot {
@@ -5209,17 +5219,25 @@ fn sample_object_pixel_component(
         return 0;
     }
 
-    match &obj.backend {
-        ObjectBackend::Movie {
-            image_id: Some(id), ..
-        } if obj.object_type == 9 && cut_no == 0 => {
+    match (&obj.backend, obj.object_type, cut_no) {
+        (
+            ObjectBackend::Movie {
+                image_id: Some(id), ..
+            },
+            9,
+            0,
+        ) => {
             return sample_image_component(ctx, id, x, y, channel);
         }
-        ObjectBackend::Rect {
-            layer_id,
-            sprite_id,
-            ..
-        } if matches!(obj.object_type, 8 | 10 | 11) && cut_no == 0 => {
+        (
+            ObjectBackend::Rect {
+                layer_id,
+                sprite_id,
+                ..
+            },
+            8 | 10 | 11,
+            0,
+        ) => {
             return sample_sprite_component(ctx, *layer_id, *sprite_id, x, y, channel);
         }
         _ => {}
@@ -7188,7 +7206,11 @@ fn clone_object_from_element(
         crate::runtime::forms::codes::STAGE_ELM_OBJECT
     };
     match parse_target(ctx, element)? {
-        StageTarget::ChildItemRef { stage, child, idx } if child == stage_object && idx >= 0 => st
+        StageTarget::ChildItemRef {
+            stage,
+            child,
+            idx: idx @ 0..,
+        } if child == stage_object => st
             .object_lists
             .get(&stage)
             .and_then(|list| list.get(idx as usize))
@@ -7196,10 +7218,10 @@ fn clone_object_from_element(
         StageTarget::ChildItemOp {
             stage,
             child,
-            idx,
+            idx: idx @ 0..,
             op,
             tail,
-        } if child == stage_object && idx >= 0 => {
+        } if child == stage_object => {
             let base = st
                 .object_lists
                 .get(&stage)
@@ -7926,14 +7948,21 @@ fn dispatch_object_state_op(
             // The original C++ recursively dispatches directly through the child
             // C_elm_object*.  Keep the embedded ObjectState in place and recurse on
             // it directly instead of swapping it through a top-level scratch slot.
-            let prev_chain = ctx.globals.current_object_chain.clone();
+            // The parent's chain is moved aside, not cloned: particle frame
+            // actions address object children thousands of times a frame.
+            let prev_chain = match ctx.globals.current_object_chain.as_deref() {
+                Some(chain) => {
+                    let mut prefix = ctx.int_vec_pool.take_copy(chain);
+                    prefix.extend([
+                        crate::runtime::forms::codes::elm_value::OBJECT_CHILD,
+                        ctx.ids.elm_array,
+                        child_idx as i32,
+                    ]);
+                    ctx.globals.current_object_chain.replace(prefix)
+                }
+                None => None,
+            };
             let prev_stage_object = ctx.globals.current_stage_object;
-            if let Some(mut prefix) = prev_chain.clone() {
-                prefix.push(crate::runtime::forms::codes::elm_value::OBJECT_CHILD);
-                prefix.push(ctx.ids.elm_array);
-                prefix.push(child_idx as i32);
-                ctx.globals.current_object_chain = Some(prefix);
-            }
             ctx.globals.current_stage_object = Some((stage_idx, runtime_slot));
             if sg_mwnd_object_trace_enabled() {
                 let child = &obj.runtime.child_objects[child_idx];
@@ -7983,7 +8012,11 @@ fn dispatch_object_state_op(
                     ctx.globals.current_stage_object
                 );
             }
-            ctx.globals.current_object_chain = prev_chain;
+            // The chain being replaced is recycled (see `IntVecPool`).
+            if let Some(used) = std::mem::replace(&mut ctx.globals.current_object_chain, prev_chain)
+            {
+                ctx.int_vec_pool.give(used);
+            }
             ctx.globals.current_stage_object = prev_stage_object;
             if handled {
                 return true;
@@ -10338,15 +10371,19 @@ fn dispatch_object_state_op(
         if al_id == Some(1) {
             if let Some(Value::Element(e)) = script_args.first() {
                 match parse_target(ctx, e) {
-                    Some(StageTarget::ChildItemOp { child, idx, .. })
-                        if child == crate::runtime::forms::codes::STAGE_ELM_OBJBTNGROUP =>
-                    {
+                    Some(StageTarget::ChildItemOp {
+                        child: crate::runtime::forms::codes::STAGE_ELM_OBJBTNGROUP,
+                        idx,
+                        ..
+                    }) => {
                         obj.button.group_no = idx.max(0);
                         obj.button.group_idx_override = Some(idx.max(0) as usize);
                     }
-                    Some(StageTarget::ChildItemRef { child, idx, .. })
-                        if child == crate::runtime::forms::codes::STAGE_ELM_OBJBTNGROUP =>
-                    {
+                    Some(StageTarget::ChildItemRef {
+                        child: crate::runtime::forms::codes::STAGE_ELM_OBJBTNGROUP,
+                        idx,
+                        ..
+                    }) => {
                         obj.button.group_no = idx.max(0);
                         obj.button.group_idx_override = Some(idx.max(0) as usize);
                     }
@@ -11401,10 +11438,10 @@ fn dispatch_object_state_op(
         {
             match pct {
                 crate::resource::PctType::G00 => {
-                    if let Ok(bytes) = crate::resource::read_file_bytes(&path)
-                        && let Ok(decoded) = crate::assets::g00::decode_g00(&bytes)
-                    {
-                        cnt = decoded.frames.len() as i64;
+                    // Through the image cache: particle scripts ask every
+                    // frame, and decoding the file each time dominated them.
+                    if let Ok(id) = ctx.images.load_file(&path, 0) {
+                        cnt = ctx.images.album_len(&id) as i64;
                     }
                 }
                 _ => {
@@ -15733,8 +15770,7 @@ pub fn dispatch(ctx: &mut CommandContext, args: &[Value]) -> Result<bool> {
                 };
 
                 if child == stage_object {
-                    let prev_chain = ctx.globals.current_object_chain.clone();
-                    ctx.globals.current_object_chain = Some(vec![
+                    let prev_chain = ctx.globals.current_object_chain.replace(vec![
                         form_id as i32,
                         ctx.ids.elm_array,
                         stage as i32,
@@ -15754,7 +15790,12 @@ pub fn dispatch(ctx: &mut CommandContext, args: &[Value]) -> Result<bool> {
                         rhs,
                         al_id,
                     );
-                    ctx.globals.current_object_chain = prev_chain;
+                    // The chain being replaced is recycled (see `IntVecPool`).
+                    if let Some(used) =
+                        std::mem::replace(&mut ctx.globals.current_object_chain, prev_chain)
+                    {
+                        ctx.int_vec_pool.give(used);
+                    }
                     handled
                 } else if child == crate::runtime::forms::codes::STAGE_ELM_OBJBTNGROUP {
                     dispatch_group_item_op(

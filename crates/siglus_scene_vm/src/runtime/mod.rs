@@ -33,9 +33,9 @@ use crate::runtime::forms::pcmevent as pcmevent_form;
 use crate::runtime::forms::syscom as syscom_form;
 use scene_metadata::SceneMetadata;
 
+use crate::runtime::globals::{HashMap, HashSet};
 use anyhow::{Result, anyhow};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -206,6 +206,47 @@ pub enum ProcKind {
     SystemModal,
 }
 
+/// Spare `Vec<i32>` buffers for element paths and object chains, which the
+/// VM makes and drops for every property access: reusing them saves an
+/// allocation and a free each time (a tenth of the VM's frame time in
+/// particle scripts, more with the console allocators).
+#[derive(Debug, Default)]
+pub struct IntVecPool {
+    spare: Vec<Vec<i32>>,
+}
+
+impl IntVecPool {
+    const MAX_SPARE: usize = 32;
+    const MAX_CAPACITY: usize = 64;
+
+    /// An empty vector, reused when one is spare.
+    pub fn take(&mut self) -> Vec<i32> {
+        self.spare.pop().unwrap_or_default()
+    }
+
+    /// A copy of `items` in a reused vector.
+    pub fn take_copy(&mut self, items: &[i32]) -> Vec<i32> {
+        let mut v = self.take();
+        v.extend_from_slice(items);
+        v
+    }
+
+    /// Keeps `v` for reuse (small ones, a few at a time).
+    pub fn give(&mut self, mut v: Vec<i32>) {
+        if self.spare.len() < Self::MAX_SPARE && v.capacity() <= Self::MAX_CAPACITY {
+            v.clear();
+            self.spare.push(v);
+        }
+    }
+}
+
+impl Clone for IntVecPool {
+    /// Spare buffers are not state: a copy starts without them.
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct VmCallMeta {
     pub element: Vec<i32>,
@@ -351,6 +392,8 @@ struct MouseCursorRuntime {
 }
 
 pub struct CommandContext {
+    /// Reused element/chain buffers (see `IntVecPool`).
+    pub int_vec_pool: IntVecPool,
     pub project_dir: PathBuf,
 
     /// Project-wide variable DWORD used by encrypted Emote PSB files. Native
@@ -845,6 +888,10 @@ impl CommandContext {
                 || obj.frame_action_ch.iter().any(frame_action_needs_tick)
                 || obj.movie.playing
                 || obj.gan.is_active()
+                // Emote Progress also drives procedural blinking, breathing
+                // and physics after authored timelines finish. Keep ticking
+                // a live player while the script waits for reader input.
+                || (obj.object_type == 12 && obj.emote.runtime.is_some())
                 || obj.runtime.child_objects.iter().any(object_needs_tick)
         }
 
@@ -1488,6 +1535,7 @@ impl CommandContext {
             stack: Vec::new(),
             unknown,
             ids,
+            int_vec_pool: IntVecPool::default(),
             gfx: graphics::GfxRuntime::default(),
             ui: ui::UiRuntime::default(),
             font_cache: FontCache::new(),
@@ -1504,9 +1552,9 @@ impl CommandContext {
             globals: globals::GlobalState::default(),
             tonecurve,
             excall_state: ExcallCompatState::default(),
-            render_object_keys_scratch: HashSet::new(),
-            mouse_cursor_cache: HashMap::new(),
-            failed_gfx_image_repairs: HashSet::new(),
+            render_object_keys_scratch: HashSet::default(),
+            mouse_cursor_cache: HashMap::default(),
+            failed_gfx_image_repairs: HashSet::default(),
             external_forms: None,
             native_ui_backend: None,
             native_ui: native_ui::NativeUiRuntime::default(),
@@ -2123,14 +2171,14 @@ impl CommandContext {
                 easy_angou_code: Some(siglus_assets::keys::SCENE_KEY.to_vec()),
                 string_encryption_override,
             };
-            ScenePck::load_and_rebuild_from_bytes(bytes, &opt)?
+            ScenePck::load_lazy_from_bytes(bytes, &opt)?
         };
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let pck = {
             let scene_pck_path =
                 crate::resource::find_scene_pck_path_for_append(&self.project_dir, &active_append)?;
             let opt = crate::resource::load_scene_pck_decode_options(&self.project_dir)?;
-            ScenePck::load_and_rebuild(&scene_pck_path, &opt)?
+            ScenePck::load_lazy(&scene_pck_path, &opt)?
         };
         self.install_scene_metadata(&active_append, &pck)?;
         let slot = self.scene_metadata.borrow();
@@ -3845,7 +3893,7 @@ impl CommandContext {
             leave_msgbk: false,
             save_id: 0,
         });
-        if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+        if env_is_set!("SG_PROC_FLOW_TRACE") {
             eprintln!(
                 "[SG_PROC_FLOW] open_syscom_menu_from_cancel_key scene={:?} line={} pending_proc={:?}",
                 self.current_scene_name, self.current_line_no, self.globals.syscom.pending_proc
@@ -4566,6 +4614,8 @@ impl CommandContext {
     }
 
     pub fn tick_frame(&mut self) {
+        #[cfg(target_os = "vita")]
+        self.movie.evict_idle_streams();
         let now = crate::platform_time::Instant::now();
         let last = self.frame_clock_last.replace(now);
         let real_delta_ms = match last {
@@ -4590,7 +4640,7 @@ impl CommandContext {
             real_delta_ms
         };
         self.update_selbtn_animation(game_delta_ms as i64);
-        let trace = std::env::var_os("SG_CTX_TICK_TRACE").is_some();
+        let trace = env_is_set!("SG_CTX_TICK_TRACE");
         if trace {
             eprintln!(
                 "[SG_CTX_TICK] start game_delta_ms={} real_delta_ms={}",
@@ -4891,7 +4941,7 @@ impl CommandContext {
             return;
         }
 
-        let mut resolved_masks = HashMap::new();
+        let mut resolved_masks = HashMap::default();
         for (mask_name, _, _) in mask_info.iter().flatten() {
             if resolved_masks.contains_key(mask_name) {
                 continue;
@@ -5011,7 +5061,7 @@ impl CommandContext {
     }
 
     fn apply_gan_effects(&mut self, sprites: &mut Vec<RenderSprite>) {
-        let mut index: HashMap<(Option<LayerId>, Option<SpriteId>), usize> = HashMap::new();
+        let mut index: HashMap<(Option<LayerId>, Option<SpriteId>), usize> = HashMap::default();
         for (i, s) in sprites.iter().enumerate() {
             index.insert((s.layer_id, s.sprite_id), i);
         }
@@ -6365,7 +6415,7 @@ impl CommandContext {
         }
 
         let (slider_x, _slider_top, _slider_bottom) = self.msg_back_slider_track();
-        if std::env::var_os("SG_MSGBK_TRACE").is_some() {
+        if env_is_set!("SG_MSGBK_TRACE") {
             eprintln!(
                 "[SG_MSGBK_TRACE][PROJECTION] entries={} separators={} text={} koe={} load={} total_height={} scroll={} slider={} target={} mouse_target={}",
                 layout.entries.len(),
@@ -7867,7 +7917,7 @@ impl CommandContext {
     }
 
     fn sync_global_movie(&mut self) {
-        let trace = std::env::var_os("SG_MOVIE_TRACE").is_some();
+        let trace = env_is_set!("SG_MOVIE_TRACE");
         let file_name = self.globals.mov.file_name.clone();
 
         if !self.globals.mov.playing || file_name.as_deref().unwrap_or("").is_empty() {
@@ -8482,8 +8532,8 @@ impl CommandContext {
         &self,
         submitted: &[RenderSprite],
     ) -> Vec<DebugActiveTextureEntry> {
-        let mut submitted_keys: HashSet<(LayerId, SpriteId)> = HashSet::new();
-        let mut submitted_images: HashSet<ImageHandle> = HashSet::new();
+        let mut submitted_keys: HashSet<(LayerId, SpriteId)> = HashSet::default();
+        let mut submitted_images: HashSet<ImageHandle> = HashSet::default();
         for rs in submitted {
             if let Some(ref id) = rs.sprite.image_id {
                 submitted_images.insert(id.clone());
@@ -8493,7 +8543,7 @@ impl CommandContext {
             }
         }
 
-        let mut acc: HashMap<ImageHandle, DebugActiveTextureAccum> = HashMap::new();
+        let mut acc: HashMap<ImageHandle, DebugActiveTextureAccum> = HashMap::default();
         let mut form_ids: Vec<u32> = self.globals.stage_forms.keys().copied().collect();
         form_ids.sort_unstable();
         for form_id in form_ids {
@@ -8805,7 +8855,7 @@ fn trace_config_event_frame_prop_write(
 
 fn save_load_render_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("SG_SAVELOAD_TRACE").is_some())
+    *ENABLED.get_or_init(|| env_is_set!("SG_SAVELOAD_TRACE"))
 }
 
 fn trace_save_load_render_sprites(ctx: &CommandContext, list: &[RenderSprite]) {
@@ -10361,6 +10411,33 @@ fn fetch_bound_render_sprites_for_hit(
     out
 }
 
+/// The first sprite `fetch_bound_render_sprites_for_hit` would return,
+/// borrowed: parents only read a few of its fields, and cloning every bound
+/// sprite of every parent on each hover update showed in profiles.
+fn first_bound_render_sprite<'a>(
+    layers: &'a LayerManager,
+    gfx: &graphics::GfxRuntime,
+    stage_idx: i64,
+    runtime_slot: usize,
+    obj: &globals::ObjectState,
+) -> Option<&'a Sprite> {
+    let pick = |lid: LayerId, sid: SpriteId| {
+        layers
+            .layer(lid)?
+            .sprite(sid)
+            .filter(|sprite| sprite.image_id.is_some() || sprite.emote_render.is_some())
+    };
+    match &obj.backend {
+        globals::ObjectBackend::Gfx => gfx
+            .object_sprite_binding(stage_idx, runtime_slot as i64)
+            .and_then(|(lid, sid)| pick(lid, sid)),
+        globals::ObjectBackend::None => None,
+        backend => layer_backed_object_sprite_bindings(backend)
+            .into_iter()
+            .find_map(|(lid, sid)| pick(lid, sid)),
+    }
+}
+
 fn button_object_render_info(
     ids: &constants::RuntimeConstants,
     gfx: &graphics::GfxRuntime,
@@ -10655,7 +10732,7 @@ fn button_parent_render_state(
 ) -> ParentRenderState {
     let runtime_slot = object_runtime_slot(obj_idx, obj);
     let info = button_object_render_info(ids, gfx, stage_idx, obj_idx, obj);
-    let bound = fetch_bound_render_sprites_for_hit(layers, gfx, stage_idx, runtime_slot, obj);
+    let first = first_bound_render_sprite(layers, gfx, stage_idx, runtime_slot, obj);
     let mut cur = ParentRenderState {
         world_no: info.world_no,
         pos_x: (info.x + info.x_rep) as f32,
@@ -10684,19 +10761,28 @@ fn button_parent_render_state(
         color_add_b: 0,
         blend: crate::layer::SpriteBlend::Normal,
         dst_clip: info.dst_clip,
-        mask_image_id: bound.first().and_then(|s| s.sprite.mask_image_id.clone()),
-        mask_offset_x: bound.first().map(|s| s.sprite.mask_offset_x).unwrap_or(0),
-        mask_offset_y: bound.first().map(|s| s.sprite.mask_offset_y).unwrap_or(0),
-        tonecurve_image_id: bound
-            .first()
-            .and_then(|s| s.sprite.tonecurve_image_id.clone()),
-        tonecurve_row: bound.first().map(|s| s.sprite.tonecurve_row).unwrap_or(0.0),
-        tonecurve_sat: bound.first().map(|s| s.sprite.tonecurve_sat).unwrap_or(0.0),
+        mask_image_id: first.and_then(|s| s.mask_image_id.clone()),
+        mask_offset_x: first.map(|s| s.mask_offset_x).unwrap_or(0),
+        mask_offset_y: first.map(|s| s.mask_offset_y).unwrap_or(0),
+        tonecurve_image_id: first.and_then(|s| s.tonecurve_image_id.clone()),
+        tonecurve_row: first.map(|s| s.tonecurve_row).unwrap_or(0.0),
+        tonecurve_sat: first.map(|s| s.tonecurve_sat).unwrap_or(0.0),
     };
     if let Some(parent) = parent_state {
         cur = compose_parent_render_state(parent, cur);
     }
     cur
+}
+
+/// Whether an object or a descendant owns a standalone button (as `recurse`
+/// in `hit_test_standalone_action_button_recursive` decides it).
+fn subtree_has_standalone_button_owner(obj: &globals::ObjectState) -> bool {
+    (has_standalone_button_registration(obj) && !obj.base.no_event_hint)
+        || obj
+            .runtime
+            .child_objects
+            .iter()
+            .any(subtree_has_standalone_button_owner)
 }
 
 fn hit_test_standalone_action_button_recursive(
@@ -10777,10 +10863,27 @@ fn hit_test_standalone_action_button_recursive(
                 event_enabled: owner.event_enabled,
             });
         }
+        // Children can only hit through a button owner: an inherited one or
+        // one in their own subtree. Without either, the render state they
+        // would get (about forty property reads per parent, every frame) is
+        // never used.
+        if obj.runtime.child_objects.is_empty()
+            || (effective_owner.is_none()
+                && !obj
+                    .runtime
+                    .child_objects
+                    .iter()
+                    .any(subtree_has_standalone_button_owner))
+        {
+            return if tied { None } else { best };
+        }
         let cur_parent_state =
             button_parent_render_state(layers, gfx, ids, stage_idx, obj_idx, obj, parent_state);
         let parent_sort = object_button_sort_key(ids, gfx, stage_idx, runtime_slot, obj);
         for (child_idx, child) in obj.runtime.child_objects.iter_mut().enumerate() {
+            if effective_owner.is_none() && !subtree_has_standalone_button_owner(child) {
+                continue;
+            }
             if let Some(mut hit) = recurse(
                 images,
                 layers,
@@ -11513,8 +11616,8 @@ fn weather_pattern(obj: &mut globals::ObjectState, idx: usize) -> i64 {
     let first = p.pat_no_00.min(p.pat_no_01);
     let last = p.pat_no_00.max(p.pat_no_01);
     let span = (last - first + 1).max(1);
-    match p.pat_mode {
-        1 if p.pat_time > 0 => {
+    match (p.pat_mode, p.pat_time) {
+        (1, 1..) => {
             let t = obj
                 .weather_work
                 .sub
@@ -11523,7 +11626,7 @@ fn weather_pattern(obj: &mut globals::ObjectState, idx: usize) -> i64 {
                 .unwrap_or(0);
             first + t.saturating_mul(span) / p.pat_time
         }
-        2 => first + obj.weather_work.rand_mod(span),
+        (2, _) => first + obj.weather_work.rand_mod(span),
         _ => p.pat_no_00,
     }
 }
@@ -11841,6 +11944,7 @@ fn install_object_movie_stream_frame(
     file: &str,
     frame_idx: usize,
     frame: std::sync::Arc<crate::assets::RgbaImage>,
+    source_size: Option<(u32, u32)>,
     trace: bool,
 ) {
     let globals::ObjectBackend::Movie {
@@ -11869,12 +11973,25 @@ fn install_object_movie_stream_frame(
     };
     obj.movie.frame_image_cursor = 0;
 
+    // The object is as large as the video, even when the decoded picture is
+    // smaller (Vita): the sprite then stretches it to that size.
+    let (video_w, video_h) = source_size
+        .filter(|&(w, h)| w > 0 && h > 0)
+        .unwrap_or((frame.width, frame.height));
     *image_id = Some(img_id.clone());
-    *width = frame.width;
-    *height = frame.height;
+    *width = video_w;
+    *height = video_h;
     if let Some(layer) = layers.layer_mut(*layer_id)
         && let Some(sprite) = layer.sprite_mut(*sprite_id)
     {
+        sprite.size_mode = if (video_w, video_h) == (frame.width, frame.height) {
+            SpriteSizeMode::Intrinsic
+        } else {
+            SpriteSizeMode::Explicit {
+                width: video_w,
+                height: video_h,
+            }
+        };
         sprite.image_id = Some(img_id.clone());
         sprite.object_anchor = true;
         sprite.texture_center_x = 0.0;
@@ -11970,7 +12087,7 @@ fn sync_movie_object_recursive(
     obj: &mut globals::ObjectState,
     _decoded_any: &mut bool,
 ) {
-    let trace = std::env::var_os("SG_MOVIE_TRACE").is_some();
+    let trace = env_is_set!("SG_MOVIE_TRACE");
     if obj.object_type == 9
         && let Some(file_name) = obj.file_name.clone()
     {
@@ -12247,7 +12364,16 @@ fn sync_movie_object_recursive(
                 obj.movie.last_frame_idx = Some(frame_idx);
                 let frame = polled.frame.clone();
                 install_object_movie_stream_frame(
-                    layers, images, obj, stage_idx, obj_idx, file, frame_idx, frame, trace,
+                    layers,
+                    images,
+                    obj,
+                    stage_idx,
+                    obj_idx,
+                    file,
+                    frame_idx,
+                    frame,
+                    polled.source_size,
+                    trace,
                 );
             }
             // Keep OBJECT movie video on the same independent media clock as
@@ -13634,37 +13760,37 @@ fn append_object_tree_nodes(
     } else {
         info.child_sort_type
     };
-    match tree_sort_type {
-        0 | 1 => {
+    match (tree_sort_type, obj.object_type) {
+        (0 | 1, _) => {
             // DEFAULT is sorted at tree-flatten time because one child object
             // may expand to several sibling nodes (STRING/NUMBER/WEATHER).
             // NONE preserves insertion order.
         }
-        2 => {
+        (2, _) => {
             children.sort_by(|(lhs_idx, lhs), (rhs_idx, rhs)| {
                 object_tree_texture_key(ctx, stage_idx, *lhs_idx, lhs)
                     .cmp(&object_tree_texture_key(ctx, stage_idx, *rhs_idx, rhs))
             });
         }
-        3 if obj.object_type == 0 => {
+        (3, 0) => {
             children.sort_by_key(|(_, child)| object_tree_stored_axis(child, 0));
         }
-        4 if obj.object_type == 0 => {
+        (4, 0) => {
             children.sort_by_key(|(_, child)| std::cmp::Reverse(object_tree_stored_axis(child, 0)));
         }
-        5 if obj.object_type == 0 => {
+        (5, 0) => {
             children.sort_by_key(|(_, child)| object_tree_stored_axis(child, 1));
         }
-        6 if obj.object_type == 0 => {
+        (6, 0) => {
             children.sort_by_key(|(_, child)| std::cmp::Reverse(object_tree_stored_axis(child, 1)));
         }
-        7 if obj.object_type == 0 => {
+        (7, 0) => {
             children.sort_by_key(|(_, child)| object_tree_stored_axis(child, 2));
         }
-        8 if obj.object_type == 0 => {
+        (8, 0) => {
             children.sort_by_key(|(_, child)| std::cmp::Reverse(object_tree_stored_axis(child, 2)));
         }
-        3..=8 => {
+        (3..=8, _) => {
             // In the original source, X/Y/Z child sorting is implemented only
             // for TYPE_NONE. Other object types append no children for these
             // modes.
@@ -14357,16 +14483,19 @@ fn collect_selbtn_sprite_visuals_recursive(
     text_color: Option<(u8, u8, u8)>,
     map: &mut HashMap<(LayerId, SpriteId), SelBtnSpriteVisual>,
 ) {
-    match &obj.backend {
-        globals::ObjectBackend::Gfx | globals::ObjectBackend::None => {}
-        globals::ObjectBackend::String {
-            layer_id,
-            shadow_sprite_id,
-            fuchi_sprite_id,
-            sprite_id,
-            glyphs,
-            ..
-        } if component == 2 => {
+    match (&obj.backend, component) {
+        (globals::ObjectBackend::Gfx | globals::ObjectBackend::None, _) => {}
+        (
+            globals::ObjectBackend::String {
+                layer_id,
+                shadow_sprite_id,
+                fuchi_sprite_id,
+                sprite_id,
+                glyphs,
+                ..
+            },
+            2,
+        ) => {
             // The original text item owns three sprites per glyph.  Only body
             // sprites switch between normal/hit colours; shadow and fuchi
             // retain their configured colours.
@@ -14435,7 +14564,7 @@ fn collect_selbtn_sprite_visuals_recursive(
 }
 
 fn apply_selbtn_item_visuals(ctx: &mut CommandContext, sprites: &mut [RenderSprite]) {
-    let mut map: HashMap<(LayerId, SpriteId), SelBtnSpriteVisual> = HashMap::new();
+    let mut map: HashMap<(LayerId, SpriteId), SelBtnSpriteVisual> = HashMap::default();
     let template_no = ctx.globals.selbtn.template_no.max(0) as usize;
     let hit_color_no = ctx
         .globals
@@ -15232,7 +15361,7 @@ fn build_siglus_object_render_list(
 
 fn trace_codes_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("SIGLUS_TRACE_CODES").is_some())
+    *ENABLED.get_or_init(|| env_is_set!("SIGLUS_TRACE_CODES"))
 }
 
 pub fn dispatch_form_code(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Result<bool> {
@@ -15274,7 +15403,7 @@ pub fn dispatch(ctx: &mut CommandContext, cmd: &Command) -> Result<()> {
 }
 
 fn apply_button_visuals(ctx: &mut CommandContext, sprites: &mut [RenderSprite]) {
-    let mut map: HashMap<(LayerId, SpriteId), ButtonVisualState> = HashMap::new();
+    let mut map: HashMap<(LayerId, SpriteId), ButtonVisualState> = HashMap::default();
 
     let mut form_ids: Vec<u32> = ctx.globals.stage_forms.keys().copied().collect();
     form_ids.sort_unstable();
@@ -15504,7 +15633,7 @@ mod button_visual_ownership_tests {
     fn visuals(obj: &globals::ObjectState) -> HashMap<(LayerId, SpriteId), ButtonVisualState> {
         let ctx = CommandContext::new(PathBuf::from("."));
         let stage = globals::StageFormState::default();
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         collect_button_visuals_recursive(&ctx, &stage, 0, 0, obj, &mut map, None);
         map
     }
@@ -16333,7 +16462,7 @@ fn ensure_font_list(syscom: &mut globals::SyscomRuntimeState, project_dir: &Path
         return;
     }
 
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for dir in [project_dir.join("font"), project_dir.join("fonts")] {
         let Some(dir) = crate::resource::resolve_game_path(&dir).ok().flatten() else {
             continue;
@@ -16633,7 +16762,7 @@ mod render_tree_fidelity_tests {
                 0,
                 None,
                 &mut nodes,
-                &mut std::collections::HashSet::new(),
+                &mut std::collections::HashSet::default(),
                 &mut Vec::new(),
             );
             let mut sprites = Vec::new();
@@ -17062,6 +17191,77 @@ mod selbtn_continuous_frame_tests {
         ctx.globals.selbtn.capture_now_flag = true;
         assert!(ctx.needs_continuous_frame());
         ctx.globals.selbtn.capture_now_flag = false;
+        assert!(!ctx.needs_continuous_frame());
+    }
+}
+
+#[cfg(test)]
+mod emote_continuous_frame_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires SIGLUS_EMOTE_TEST_PROJECT pointing to 神待少女纱波"]
+    fn live_emote_keeps_idle_dialogue_and_child_objects_ticking() {
+        let project = PathBuf::from(std::env::var_os("SIGLUS_EMOTE_TEST_PROJECT").unwrap());
+        let sources = [
+            "bup_sn01_03制服＋エプロン.psb",
+            "bup_sn01_頭部.psb",
+            "bup_共通tl.psb",
+        ]
+        .map(|name| std::fs::read(project.join("dat").join(name)).unwrap());
+        let key = siglus_assets::key_toml::load_emote_key_from_project_dir(&project).unwrap();
+        let runtime = crate::emote::SiglusEmoteRuntime::from_psb_sources(
+            &sources.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            key,
+        )
+        .unwrap();
+        // No PlayTimeline: procedural controllers alone still need Progress.
+        let mut ctx = CommandContext::new(project);
+        let form = ctx.ids.form_global_stage;
+        assert!(!ctx.needs_continuous_frame());
+        let mut obj = globals::ObjectState::default();
+        obj.used = true;
+        obj.object_type = 12;
+        obj.emote.runtime = Some(runtime);
+        ctx.globals
+            .stage_forms
+            .entry(form)
+            .or_default()
+            .object_lists
+            .insert(1, vec![obj]);
+        assert!(ctx.needs_continuous_frame());
+
+        let child = ctx
+            .globals
+            .stage_forms
+            .get_mut(&form)
+            .unwrap()
+            .object_lists
+            .get_mut(&1)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut parent = globals::ObjectState::default();
+        parent.used = true;
+        parent.runtime.child_objects.push(child);
+        ctx.globals
+            .stage_forms
+            .get_mut(&form)
+            .unwrap()
+            .object_lists
+            .insert(1, vec![parent]);
+        assert!(ctx.needs_continuous_frame());
+        ctx.globals
+            .stage_forms
+            .get_mut(&form)
+            .unwrap()
+            .object_lists
+            .get_mut(&1)
+            .unwrap()[0]
+            .runtime
+            .child_objects[0]
+            .emote
+            .clear_runtime();
         assert!(!ctx.needs_continuous_frame());
     }
 }

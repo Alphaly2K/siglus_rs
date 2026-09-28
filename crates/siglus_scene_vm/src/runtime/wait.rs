@@ -16,7 +16,7 @@ use super::globals::{GlobalState, ObjectState, StageFormState};
 use super::int_event::IntEvent;
 
 fn anim_skip_trace_enabled() -> bool {
-    std::env::var_os("SG_DEBUG").is_some()
+    env_is_set!("SG_DEBUG")
 }
 
 fn anim_skip_trace(msg: impl AsRef<str>) {
@@ -1422,6 +1422,10 @@ impl VmWait {
     pub fn wait_group_selection(&mut self, form_id: u32, stage_idx: i64, group_idx: usize) {
         self.mark_block_request();
         self.group_selection = Some((form_id, stage_idx, group_idx));
+    }
+
+    pub(crate) fn button_selection_waiting(&self) -> bool {
+        self.selbtn || self.group_selection.is_some()
     }
 
     pub fn wait_input_key(&mut self, skip_disabled: bool) {

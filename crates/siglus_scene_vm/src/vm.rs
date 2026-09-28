@@ -1,5 +1,6 @@
 //! Scene VM
 
+mod close;
 mod early_save;
 mod short_save;
 use crate::original_save::NativeLocalLayout;
@@ -27,7 +28,8 @@ use siglus_assets::scene_pck::{ScenePck, ScenePckDecodeOptions};
 // path.
 macro_rules! vm_trace {
     ($vm:expr, $pc:expr, $msg:expr $(,)?) => {{
-        if $vm.vm_trace_matches() {
+        // The flag is tested inline: this runs for every opcode and push.
+        if $vm.vm_trace_config.enabled && $vm.vm_trace_matches() {
             $vm.vm_trace_emit($pc, $msg);
         }
     }};
@@ -154,7 +156,7 @@ struct VmTraceConfig {
 
 impl VmTraceConfig {
     fn from_env() -> Self {
-        let enabled = std::env::var_os("SIGLUS_TRACE_VM").is_some();
+        let enabled = env_is_set!("SIGLUS_TRACE_VM");
         let scene = std::env::var("SIGLUS_TRACE_VM_SCENE")
             .ok()
             .filter(|value| !value.is_empty());
@@ -172,7 +174,7 @@ impl VmTraceConfig {
             enabled,
             scene,
             pc_range,
-            commands_enabled: std::env::var_os("SIGLUS_TRACE_VM_COMMANDS").is_some(),
+            commands_enabled: env_is_set!("SIGLUS_TRACE_VM_COMMANDS"),
         }
     }
 }
@@ -202,20 +204,20 @@ impl VmRuntimeOptions {
                 .unwrap_or(0)
         }
 
-        let sg_debug = std::env::var_os("SG_DEBUG").is_some();
+        let sg_debug = env_is_set!("SG_DEBUG");
         Self {
             inline_user_cmd_max_steps: env_u64("SIGLUS_INLINE_USER_CMD_MAX_STEPS"),
             frame_action_max_steps: env_u64("SIGLUS_FRAME_ACTION_MAX_STEPS"),
-            trace_unknown_forms: std::env::var_os("SIGLUS_TRACE_UNKNOWN_FORMS").is_some(),
-            proc_flow_trace: std::env::var_os("SG_PROC_FLOW_TRACE").is_some(),
+            trace_unknown_forms: env_is_set!("SIGLUS_TRACE_UNKNOWN_FORMS"),
+            proc_flow_trace: env_is_set!("SG_PROC_FLOW_TRACE"),
             sg_debug,
-            syscom_proc_trace: sg_debug || std::env::var_os("SG_SYSCOM_PROC_TRACE").is_some(),
-            tick_trace: std::env::var_os("SG_TICK_TRACE").is_some(),
-            frame_action_trace: std::env::var_os("SG_FRAME_ACTION_TRACE").is_some(),
-            title_chain_trace: std::env::var_os("SG_TITLE_CHAIN_TRACE").is_some(),
-            save_load_trace: std::env::var_os("SG_SAVELOAD_TRACE").is_some(),
-            trace_call_return_pc: std::env::var_os("SIGLUS_TRACE_CALL_RETURN_PC").is_some(),
-            trace_frame_action_call: std::env::var_os("SIGLUS_TRACE_FRAME_ACTION_CALL").is_some(),
+            syscom_proc_trace: sg_debug || env_is_set!("SG_SYSCOM_PROC_TRACE"),
+            tick_trace: env_is_set!("SG_TICK_TRACE"),
+            frame_action_trace: env_is_set!("SG_FRAME_ACTION_TRACE"),
+            title_chain_trace: env_is_set!("SG_TITLE_CHAIN_TRACE"),
+            save_load_trace: env_is_set!("SG_SAVELOAD_TRACE"),
+            trace_call_return_pc: env_is_set!("SIGLUS_TRACE_CALL_RETURN_PC"),
+            trace_frame_action_call: env_is_set!("SIGLUS_TRACE_FRAME_ACTION_CALL"),
         }
     }
 }
@@ -1156,7 +1158,7 @@ impl<'a> SceneVm<'a> {
                 self.call_stack.len()
             );
         }
-        self.farcall_scene_name_ex(&scene_name, z_no, self.cfg.fm_void, true, &[])?;
+        self.call_syscom_scene(&scene_name, z_no)?;
         if self.runtime_options.proc_flow_trace {
             eprintln!(
                 "[SG_PROC_FLOW] syscom_config_scene entered key={} now_scene={:?} line={} scene_stack={} call_depth={}",
@@ -1168,6 +1170,12 @@ impl<'a> SceneVm<'a> {
             );
         }
         Ok(true)
+    }
+
+    /// Enter a game-owned system menu. The host must suspend the caller's wait
+    /// and service the script-proc push/pop requests, as for CONFIG_SCENE.
+    fn call_syscom_scene(&mut self, scene_name: &str, z_no: i32) -> Result<()> {
+        self.farcall_scene_name_ex(scene_name, z_no, self.cfg.fm_void, true, &[])
     }
 
     #[inline(always)]
@@ -1965,6 +1973,11 @@ impl<'a> SceneVm<'a> {
         Ok(true)
     }
 
+    pub fn install_initial_scene_pck(&mut self, pack: ScenePck, append_dir: String) {
+        self.scene_pck_cache = Some(pack);
+        self.scene_pck_append_dir = Some(append_dir);
+    }
+
     fn ensure_scene_pck_cache(&mut self) -> Result<()> {
         let active_append = self.ctx.globals.append_dir.clone();
         let append_changed = self
@@ -2010,13 +2023,13 @@ impl<'a> SceneVm<'a> {
                 easy_angou_code: Some(siglus_assets::keys::SCENE_KEY.to_vec()),
                 string_encryption_override,
             };
-            self.scene_pck_cache = Some(ScenePck::load_and_rebuild_from_bytes(bytes, &opt)?);
+            self.scene_pck_cache = Some(ScenePck::load_lazy_from_bytes(bytes, &opt)?);
         }
 
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         {
             let opt = crate::resource::load_scene_pck_decode_options(&self.ctx.project_dir)?;
-            self.scene_pck_cache = Some(ScenePck::load_and_rebuild(&scene_pck_path, &opt)?);
+            self.scene_pck_cache = Some(ScenePck::load_lazy(&scene_pck_path, &opt)?);
         }
 
         self.ctx.install_scene_metadata(
@@ -2846,7 +2859,10 @@ impl<'a> SceneVm<'a> {
         obj: &crate::runtime::globals::ObjectState,
         stage_idx: i64,
         obj_idx: usize,
-        object_chain: Vec<i32>,
+        // Extended and truncated in place while descending: most objects
+        // (particles) have no frame action, and a copy per child per frame
+        // added up.
+        object_chain: &mut Vec<i32>,
         out: &mut Vec<FrameActionWork>,
     ) {
         let fa = &obj.frame_action;
@@ -2894,17 +2910,20 @@ impl<'a> SceneVm<'a> {
             // every allocated child slot therefore has use_flag=true even when
             // its current type is NONE.  Recurse over the list itself instead
             // of treating ObjectState::used as C_elm_object::is_use().
-            let mut child_chain = object_chain.clone();
-            child_chain.push(crate::runtime::forms::codes::elm_value::OBJECT_CHILD);
-            child_chain.push(crate::runtime::forms::codes::ELM_ARRAY);
-            child_chain.push(child_idx as i32);
+            let depth = object_chain.len();
+            object_chain.extend([
+                crate::runtime::forms::codes::elm_value::OBJECT_CHILD,
+                crate::runtime::forms::codes::ELM_ARRAY,
+                child_idx as i32,
+            ]);
             Self::collect_object_frame_action_work_recursive(
                 child,
                 stage_idx,
                 child_idx,
-                child_chain,
+                object_chain,
                 out,
             );
+            object_chain.truncate(depth);
         }
     }
 
@@ -3724,7 +3743,7 @@ impl<'a> SceneVm<'a> {
                     {
                         continue;
                     }
-                    let object_chain = vec![
+                    let mut object_chain = vec![
                         form_id as i32,
                         self.ctx.ids.elm_array,
                         stage_idx as i32,
@@ -3736,7 +3755,7 @@ impl<'a> SceneVm<'a> {
                         obj,
                         stage_idx,
                         obj_idx,
-                        object_chain,
+                        &mut object_chain,
                         &mut work,
                     );
                 }
@@ -3750,7 +3769,7 @@ impl<'a> SceneVm<'a> {
                 };
                 for (mwnd_idx, mwnd) in mwnds.iter().enumerate() {
                     for (obj_idx, obj) in mwnd.button_list.iter().enumerate() {
-                        let object_chain = vec![
+                        let mut object_chain = vec![
                             form_id as i32,
                             self.ctx.ids.elm_array,
                             stage_idx as i32,
@@ -3765,12 +3784,12 @@ impl<'a> SceneVm<'a> {
                             obj,
                             stage_idx,
                             obj_idx,
-                            object_chain,
+                            &mut object_chain,
                             &mut work,
                         );
                     }
                     for (obj_idx, obj) in mwnd.face_list.iter().enumerate() {
-                        let object_chain = vec![
+                        let mut object_chain = vec![
                             form_id as i32,
                             self.ctx.ids.elm_array,
                             stage_idx as i32,
@@ -3785,12 +3804,12 @@ impl<'a> SceneVm<'a> {
                             obj,
                             stage_idx,
                             obj_idx,
-                            object_chain,
+                            &mut object_chain,
                             &mut work,
                         );
                     }
                     for (obj_idx, obj) in mwnd.object_list.iter().enumerate() {
-                        let object_chain = vec![
+                        let mut object_chain = vec![
                             form_id as i32,
                             self.ctx.ids.elm_array,
                             stage_idx as i32,
@@ -3805,7 +3824,7 @@ impl<'a> SceneVm<'a> {
                             obj,
                             stage_idx,
                             obj_idx,
-                            object_chain,
+                            &mut object_chain,
                             &mut work,
                         );
                     }
@@ -4855,7 +4874,7 @@ impl<'a> SceneVm<'a> {
                 self.int_stack.len()
             );
         }
-        let elm = self.int_stack[start..].to_vec();
+        let elm = self.ctx.int_vec_pool.take_copy(&self.int_stack[start..]);
         self.int_stack.truncate(start);
         vm_trace!(self, None, format!("pop_element -> {:?}", elm));
         Ok(elm)
@@ -5337,6 +5356,47 @@ impl<'a> SceneVm<'a> {
         }
     }
 
+    /// Reads a CALL_PROP without copying it: references continue into the
+    /// composed element, plain ints are pushed. False for the other forms
+    /// (`push_call_prop_result` handles them). Frame-action scripts read
+    /// these props thousands of times a frame.
+    fn push_call_prop_fast(&mut self, frame: usize, prop_idx: usize, sub: &[i32]) -> Result<bool> {
+        let prop = &self.call_stack[frame].user_props[prop_idx];
+        if let Some(composed) = self.compose_call_prop_tail(prop, sub) {
+            self.exec_property(composed)?;
+            return Ok(true);
+        }
+        use crate::runtime::forms::codes::{
+            FM_INT, FM_INTLIST, FM_INTLISTREF, FM_INTREF, FM_STR, FM_STRLIST, FM_STRLISTREF,
+            FM_STRREF,
+        };
+        let plain = sub.is_empty() || (sub.len() == 1 && self.call_array_marker(sub[0]));
+        match (prop.form, &prop.value) {
+            (FM_INT, CallPropValue::Int(n)) if plain => {
+                let n = *n;
+                self.push_int(n);
+            }
+            (FM_STR, CallPropValue::Str(text)) if plain => {
+                let text = text.clone();
+                self.push_str(text);
+            }
+            // The catch-all arm of `push_call_prop_result`: objects and other
+            // element-valued props push their element.
+            (
+                FM_INT | FM_STR | FM_INTLIST | FM_STRLIST | FM_INTREF | FM_STRREF | FM_INTLISTREF
+                | FM_STRLISTREF,
+                _,
+            ) => return Ok(false),
+            _ => {
+                // As `push_element`, copying straight from the call frame.
+                self.element_points.push(self.int_stack.len());
+                self.int_stack
+                    .extend_from_slice(&self.call_stack[frame].user_props[prop_idx].element);
+            }
+        }
+        Ok(true)
+    }
+
     fn compose_call_prop_tail(&self, prop: &CallProp, sub: &[i32]) -> Option<Vec<i32>> {
         // A lone ELM_ARRAY after a reference is the compiler/runtime marker used
         // while dereferencing the property itself, not an indexed access.  The
@@ -5410,36 +5470,36 @@ impl<'a> SceneVm<'a> {
         } else {
             sub
         };
-        match prop.form {
-            FM_INT if sub.is_empty() => {
+        match (prop.form, sub) {
+            (FM_INT, []) => {
                 if let CallPropValue::Int(n) = &prop.value {
                     self.push_int(*n);
                 } else {
                     bail!("CALL_PROP int storage mismatch for {:?}", full_elm);
                 }
             }
-            FM_STR if sub.is_empty() => {
+            (FM_STR, []) => {
                 if let CallPropValue::Str(s) = &prop.value {
                     self.push_str(s.clone());
                 } else {
                     bail!("CALL_PROP str storage mismatch for {:?}", full_elm);
                 }
             }
-            FM_STR => {
+            (FM_STR, _) => {
                 if let CallPropValue::Str(s) = &prop.value {
                     self.call_prop_eval_str_op(s, sub[0], &[], 0)?;
                 } else {
                     bail!("CALL_PROP str storage mismatch for {:?}", full_elm);
                 }
             }
-            FM_INTLIST => {
+            (FM_INTLIST, _) => {
                 if let CallPropValue::IntList(v) = &prop.value {
                     self.intlist_dispatch_read(v, sub, &prop.element)?;
                 } else {
                     bail!("CALL_PROP intlist storage mismatch for {:?}", full_elm);
                 }
             }
-            FM_STRLIST => {
+            (FM_STRLIST, _) => {
                 if let CallPropValue::StrList(v) = &prop.value {
                     if sub.is_empty() {
                         self.push_element(prop.element.clone());
@@ -5462,7 +5522,7 @@ impl<'a> SceneVm<'a> {
                     bail!("CALL_PROP strlist storage mismatch for {:?}", full_elm);
                 }
             }
-            FM_INTREF | FM_STRREF if sub.is_empty() => {
+            (FM_INTREF | FM_STRREF, []) => {
                 // C++ tnm_command_proc_prop() does not read the scalar here.
                 // For every *_REF form it pushes the referenced element back to
                 // the element stack. SiglusCompiler emits another CD_PROPERTY
@@ -5481,12 +5541,12 @@ impl<'a> SceneVm<'a> {
                 }
                 self.push_element(target);
             }
-            FM_INTLISTREF | FM_STRLISTREF => {
+            (FM_INTLISTREF | FM_STRLISTREF, _) => {
                 // Lists remain element-valued after dereference; their ARRAY and
                 // list-command suffixes are dispatched through the target chain.
                 self.push_element(self.call_prop_effective_element(prop));
             }
-            FM_INTREF | FM_STRREF => {
+            (FM_INTREF | FM_STRREF, _) => {
                 // A non-empty suffix should normally have been composed by
                 // compose_call_prop_tail(). Keep a precise failure here rather
                 // than silently returning the reference itself as a scalar.
@@ -5496,9 +5556,6 @@ impl<'a> SceneVm<'a> {
                     sub,
                     full_elm
                 );
-            }
-            _ if !sub.is_empty() => {
-                self.push_element(prop.element.clone());
             }
             _ => {
                 self.push_element(prop.element.clone());
@@ -5637,20 +5694,20 @@ impl<'a> SceneVm<'a> {
             FM_STRLISTREF, FM_STRREF,
         };
 
-        match prop.form {
-            FM_INT if sub.is_empty() => match rhs {
+        match (prop.form, sub) {
+            (FM_INT, []) => match rhs {
                 Value::Int(n) => {
                     prop.value = CallPropValue::Int(n as i32);
                 }
                 _ => bail!("unsupported CALL_PROP int assign sub={:?}", sub),
             },
-            FM_STR if sub.is_empty() => match rhs {
+            (FM_STR, []) => match rhs {
                 Value::Str(s) => {
                     prop.value = CallPropValue::Str(s);
                 }
                 _ => bail!("unsupported CALL_PROP str assign sub={:?}", sub),
             },
-            FM_INTLIST => {
+            (FM_INTLIST, _) => {
                 let Some((bit, index)) = Self::intlist_assignment_subscript(sub) else {
                     bail!("unsupported CALL_PROP intlist assign sub={:?}", sub);
                 };
@@ -5674,7 +5731,7 @@ impl<'a> SceneVm<'a> {
                 Self::set_user_int_list_value(&mut dst, bit, index, n as i32);
                 prop.value = CallPropValue::IntList(dst);
             }
-            FM_STRLIST if sub.len() >= 2 && sub[0] == ELM_ARRAY => match rhs {
+            (FM_STRLIST, [ELM_ARRAY, _, ..]) => match rhs {
                 Value::Str(s) => {
                     let idx = sub[1].max(0) as usize;
                     let mut dst = match std::mem::replace(
@@ -5695,7 +5752,7 @@ impl<'a> SceneVm<'a> {
                 }
                 _ => bail!("unsupported CALL_PROP strlist assign sub={:?}", sub),
             },
-            FM_INTREF | FM_STRREF | FM_INTLISTREF | FM_STRLISTREF => match rhs {
+            (FM_INTREF | FM_STRREF | FM_INTLISTREF | FM_STRLISTREF, _) => match rhs {
                 Value::Element(e) => {
                     prop.element = e.clone();
                     prop.value = CallPropValue::Element(e);
@@ -6286,12 +6343,11 @@ impl<'a> SceneVm<'a> {
         let prop_idx = self
             .find_call_prop_index_in_frame(current_idx, call_prop_id)
             .ok_or_else(|| anyhow!("missing CALL_PROP id={} for {:?}", call_prop_id, elm))?;
-        let prop = self.call_stack[current_idx].user_props[prop_idx].clone();
         let sub = &tail[1..];
-        if let Some(composed) = self.compose_call_prop_tail(&prop, sub) {
-            self.exec_property(composed)?;
+        if self.push_call_prop_fast(current_idx, prop_idx, sub)? {
             return Ok(true);
         }
+        let prop = self.call_stack[current_idx].user_props[prop_idx].clone();
         self.push_call_prop_result(&prop, sub, elm)?;
         Ok(true)
     }
@@ -6722,16 +6778,24 @@ impl<'a> SceneVm<'a> {
                 self.int_stack.len()
             );
         }
-        let slice = self.int_stack[start..].to_vec();
-        if self.sg_mwnd_object_trace_enabled() && Self::sg_mwnd_chain_interesting(&slice) {
+        let end = self.int_stack.len();
+        if self.sg_mwnd_object_trace_enabled()
+            && Self::sg_mwnd_chain_interesting(&self.int_stack[start..])
+        {
             self.sg_mwnd_object_trace_emit(format_args!(
                 "COPY_ELM slice={:?} before_current_chain={:?} before_current_stage_object={:?}",
-                slice, self.ctx.globals.current_object_chain, self.ctx.globals.current_stage_object
+                &self.int_stack[start..],
+                self.ctx.globals.current_object_chain,
+                self.ctx.globals.current_stage_object
             ));
         }
-        self.element_points.push(self.int_stack.len());
-        self.int_stack.extend_from_slice(&slice);
-        vm_trace!(self, None, format!("COPY_ELM copied {:?}", slice));
+        self.element_points.push(end);
+        self.int_stack.extend_from_within(start..end);
+        vm_trace!(
+            self,
+            None,
+            format!("COPY_ELM copied {:?}", &self.int_stack[end..])
+        );
         Ok(())
     }
 
@@ -6846,9 +6910,8 @@ impl<'a> SceneVm<'a> {
         } else {
             crate::runtime::forms::codes::ELM_ARRAY
         };
-        let is_array = |value: i32| {
-            value == elm_array || value == crate::runtime::forms::codes::ELM_ARRAY
-        };
+        let is_array =
+            |value: i32| value == elm_array || value == crate::runtime::forms::codes::ELM_ARRAY;
         let stage_form = if self.ctx.ids.form_global_stage != 0 {
             self.ctx.ids.form_global_stage as i32
         } else {
@@ -6884,7 +6947,13 @@ impl<'a> SceneVm<'a> {
                     | crate::runtime::forms::codes::elm_value::WORLDLIST_DESTROY_WORLD
             )
         {
-            return Some(vec![stage_form, elm_array, stage_idx as i32, stage_world, elm[1]]);
+            return Some(vec![
+                stage_form,
+                elm_array,
+                stage_idx as i32,
+                stage_world,
+                elm[1],
+            ]);
         }
 
         None
@@ -7596,16 +7665,15 @@ impl<'a> SceneVm<'a> {
                 .ok_or_else(|| {
                     anyhow!("missing direct CALL_PROP id={} for {:?}", call_prop_id, elm)
                 })?;
-            let prop = self.call_stack[current_idx].user_props[prop_idx].clone();
-            if let Some(composed) = self.compose_call_prop_tail(&prop, &elm[1..]) {
-                self.exec_property(composed)?;
+            if self.push_call_prop_fast(current_idx, prop_idx, &elm[1..])? {
                 vm_trace!(
                     self,
                     None,
-                    format!("exec_property direct CALL_PROP composed elm={:?}", elm),
+                    format!("exec_property direct CALL_PROP fast elm={:?}", elm),
                 );
                 return Ok(());
             }
+            let prop = self.call_stack[current_idx].user_props[prop_idx].clone();
             self.push_call_prop_result(&prop, &elm[1..], &elm)?;
             vm_trace!(
                 self,
@@ -7704,28 +7772,35 @@ impl<'a> SceneVm<'a> {
 
         let form_id = self.canonical_runtime_form_id(head as u32);
         let args: Vec<Value> = Vec::new();
-        self.ctx.vm_call = Some(runtime::VmCallMeta {
-            element: elm.clone(),
-            al_id: 0,
-            ret_form: self.cfg.fm_int as i64,
-        });
-
         vm_trace!(
             self,
             None,
             format!("exec_property dispatch form_id={} elm={:?}", form_id, elm),
         );
-        if !runtime::dispatch_form_code(&mut self.ctx, form_id, &args)? {
-            self.ctx.vm_call = None;
+        // The element moves into the call metadata and comes back after the
+        // dispatch (a dispatch error leaves the metadata as it was).
+        self.ctx.vm_call = Some(runtime::VmCallMeta {
+            element: elm,
+            al_id: 0,
+            ret_form: self.cfg.fm_int as i64,
+        });
+        let handled = runtime::dispatch_form_code(&mut self.ctx, form_id, &args)?;
+        let elm = self
+            .ctx
+            .vm_call
+            .take()
+            .map(|meta| meta.element)
+            .unwrap_or_default();
+        if !handled {
             bail!("unhandled form property chain {:?}", elm);
         }
 
-        self.ctx.vm_call = None;
         if let Some(v) = self.ctx.pop() {
             self.push_return_value_raw(v);
         } else {
             bail!("property chain returned no value: {:?}", elm);
         }
+        self.ctx.int_vec_pool.give(elm);
 
         Ok(())
     }
@@ -7896,16 +7971,22 @@ impl<'a> SceneVm<'a> {
             );
         }
         self.ctx.vm_call = Some(runtime::VmCallMeta {
-            element: elm.clone(),
+            element: elm,
             al_id: al_id as i64,
             ret_form: 0,
         });
 
-        if !runtime::dispatch_form_code(&mut self.ctx, form_id, &args)? {
-            self.ctx.vm_call = None;
+        let handled = runtime::dispatch_form_code(&mut self.ctx, form_id, &args)?;
+        let elm = self
+            .ctx
+            .vm_call
+            .take()
+            .map(|meta| meta.element)
+            .unwrap_or_default();
+        if !handled {
             bail!("unhandled form assignment chain {:?}", elm);
         }
-        self.ctx.vm_call = None;
+        self.ctx.int_vec_pool.give(elm);
         self.ctx.stack.clear();
         self.drain_pending_frame_action_finishes()?;
         Ok(())
@@ -8038,6 +8119,18 @@ impl<'a> SceneVm<'a> {
         ret_form: i32,
         args: &mut Vec<Value>,
     ) -> Result<()> {
+        let result = self.exec_command_element(&elm, al_id, ret_form, args);
+        self.ctx.int_vec_pool.give(elm);
+        result
+    }
+
+    fn exec_command_element(
+        &mut self,
+        elm: &[i32],
+        al_id: i32,
+        ret_form: i32,
+        args: &mut Vec<Value>,
+    ) -> Result<()> {
         if elm.is_empty() {
             self.push_default_for_ret(ret_form);
             return Ok(());
@@ -8091,7 +8184,7 @@ impl<'a> SceneVm<'a> {
         }
 
         match owner {
-            o if o == elm_code::ELM_OWNER_FORM => {
+            elm_code::ELM_OWNER_FORM => {
                 if let Some(synthetic) = self.legacy_global_world_stage_chain(&elm, 1) {
                     self.exec_command(synthetic, al_id, ret_form, args)?;
                     self.sync_legacy_global_worlds_from_front();
@@ -8188,7 +8281,7 @@ impl<'a> SceneVm<'a> {
 
                 let op_id = if elm.len() >= 2 { elm[1] } else { al_id };
                 self.ctx.vm_call = Some(runtime::VmCallMeta {
-                    element: elm.clone(),
+                    element: self.ctx.int_vec_pool.take_copy(elm),
                     al_id: al_id as i64,
                     ret_form: ret_form as i64,
                 });
@@ -8218,14 +8311,16 @@ impl<'a> SceneVm<'a> {
 
                 self.sg_omv_trace_command("dispatch", &elm, form_id, op_id, al_id, ret_form, args);
 
-                if !runtime::dispatch_form_code(&mut self.ctx, form_id as u32, args)? {
-                    self.ctx.vm_call = None;
+                let handled = runtime::dispatch_form_code(&mut self.ctx, form_id as u32, args);
+                if let Some(call) = self.ctx.vm_call.take() {
+                    self.ctx.int_vec_pool.give(call.element);
+                }
+                if !handled? {
                     bail!("unhandled form command chain {:?}", elm);
                 }
-                self.ctx.vm_call = None;
                 self.drain_pending_frame_action_finishes()?;
             }
-            o if o == elm_code::ELM_OWNER_USER_CMD || o == elm_code::ELM_OWNER_CALL_CMD => {
+            elm_code::ELM_OWNER_USER_CMD | elm_code::ELM_OWNER_CALL_CMD => {
                 if self.vm_trace_config.commands_enabled {
                     let cmd_no = elm_code::code(raw_head);
                     let elm_tail = elm
@@ -11459,8 +11554,8 @@ impl<'a> SceneVm<'a> {
                     name: if name.is_empty() { None } else { Some(name) },
                     x_event,
                     y_event,
-                    extra_int: std::collections::HashMap::new(),
-                    script_events: std::collections::HashMap::new(),
+                    extra_int: Default::default(),
+                    script_events: Default::default(),
                 })
             })?
         };
@@ -11508,7 +11603,7 @@ impl<'a> SceneVm<'a> {
         self.ctx
             .globals
             .stage_forms
-            .insert(normal_stage_form_id, st);
+            .insert(normal_stage_form_id, Box::new(st));
         if !back_btn_select.choices.is_empty() {
             runtime::forms::global::prepare_saved_stage_btnselitems(
                 &mut self.ctx,

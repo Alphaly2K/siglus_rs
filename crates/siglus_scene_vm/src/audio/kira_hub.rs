@@ -1,14 +1,20 @@
 use std::fmt;
 
+#[cfg(all(
+    any(target_os = "horizon", target_os = "vita"),
+    not(feature = "art3m1s-host-audio")
+))]
+use super::switch_backend::SwitchBackend as PlatformBackend;
 use anyhow::{Context, Result, anyhow};
 use kira::Volume;
-use kira::manager::{AudioManager, AudioManagerSettings};
-#[cfg(all(not(target_os = "horizon"), not(feature = "art3m1s-host-audio")))]
+#[cfg(all(
+    not(any(target_os = "horizon", target_os = "vita")),
+    not(feature = "art3m1s-host-audio")
+))]
 use kira::manager::backend::DefaultBackend as PlatformBackend;
 #[cfg(feature = "art3m1s-host-audio")]
 use kira::manager::backend::mock::{MockBackend as PlatformBackend, MockBackendSettings};
-#[cfg(target_os = "horizon")]
-use super::switch_backend::SwitchBackend as PlatformBackend;
+use kira::manager::{AudioManager, AudioManagerSettings};
 use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle};
 #[cfg(not(target_arch = "wasm32"))]
 use kira::sound::streaming::{StreamingSoundData, StreamingSoundHandle};
@@ -63,14 +69,23 @@ impl Default for AudioHub {
 
 impl AudioHub {
     pub fn new() -> Self {
-        #[cfg(feature = "art3m1s-host-audio")]
-        let settings = AudioManagerSettings {
-            backend_settings: MockBackendSettings { sample_rate: 48_000 },
-            ..AudioManagerSettings::default()
+        // Replays on the virtual clock run silent: waits on a playing sound
+        // would otherwise end by the device's real playback time.
+        let manager = if cfg!(feature = "virtual-clock") {
+            Err(anyhow!("virtual clock: audio off"))
+        } else {
+            #[cfg(feature = "art3m1s-host-audio")]
+            let settings = AudioManagerSettings {
+                backend_settings: MockBackendSettings {
+                    sample_rate: 48_000,
+                },
+                ..AudioManagerSettings::default()
+            };
+            #[cfg(not(feature = "art3m1s-host-audio"))]
+            let settings = AudioManagerSettings::default();
+            AudioManager::<PlatformBackend>::new(settings).map_err(|e| anyhow!("{e:?}"))
         };
-        #[cfg(not(feature = "art3m1s-host-audio"))]
-        let settings = AudioManagerSettings::default();
-        match AudioManager::<PlatformBackend>::new(settings) {
+        match manager {
             Ok(mut manager) => {
                 let bgm = manager.add_sub_track(TrackBuilder::default()).ok();
                 let se = manager.add_sub_track(TrackBuilder::default()).ok();

@@ -42,7 +42,7 @@ fn p_bool(params: &[Value], idx: usize) -> bool {
 }
 
 fn sg_debug_enabled_local() -> bool {
-    std::env::var_os("SG_DEBUG").is_some()
+    env_is_set!("SG_DEBUG")
 }
 
 fn set_syscom_pending_proc(ctx: &mut CommandContext, kind: SyscomPendingProcKind) {
@@ -677,7 +677,7 @@ pub(crate) fn append_current_save_message(ctx: &mut CommandContext, msg: &str) {
 }
 
 fn save_load_trace_enabled() -> bool {
-    std::env::var_os("SG_SAVELOAD_TRACE").is_some()
+    env_is_set!("SG_SAVELOAD_TRACE")
 }
 
 fn trace_save_load_event(
@@ -1725,6 +1725,33 @@ fn load_read_flags(ctx: &mut CommandContext) -> Result<()> {
     Ok(())
 }
 
+/// A fingerprint of what the global save keeps across sessions (global
+/// flags and names, CG and BGM tables, read flags), leaving out the play
+/// time. Hosts that can be killed without warning (Vita) write the global
+/// save when this changes.
+pub fn global_save_fingerprint(ctx: &CommandContext) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for code in [
+        crate::runtime::forms::codes::ELM_GLOBAL_G,
+        crate::runtime::forms::codes::ELM_GLOBAL_Z,
+    ] {
+        ctx.globals.int_lists.get(&(code as u32)).hash(&mut hasher);
+    }
+    for code in [
+        crate::runtime::forms::codes::ELM_GLOBAL_M,
+        crate::runtime::forms::codes::ELM_GLOBAL_NAMAE_GLOBAL,
+    ] {
+        ctx.globals.str_lists.get(&(code as u32)).hash(&mut hasher);
+    }
+    ctx.tables.cg_flags.hash(&mut hasher);
+    ctx.globals.bgm_table_flags.hash(&mut hasher);
+    let mut scenes: Vec<_> = ctx.globals.read_flags.iter().collect();
+    scenes.sort_by_key(|(scene, _)| **scene);
+    scenes.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub fn write_global_save(ctx: &CommandContext) {
     write_config_save(ctx);
     let mut stream = original_save::OriginalStreamWriter::new();
@@ -1889,7 +1916,7 @@ pub fn load_global_save(ctx: &mut CommandContext) -> Result<()> {
             m.resize_with(count, String::new);
         }
         namae_global.resize_with(26 + 26 * 26, String::new);
-        ctx.globals.syscom.chrkoe_look_flags = chrkoe_look_flags;
+        ctx.globals.syscom.chrkoe_look_flags = chrkoe_look_flags.into_iter().collect();
 
         ctx.globals.syscom.total_play_time = total_play_time;
         ctx.globals
@@ -3198,7 +3225,7 @@ pub(crate) fn poll_fallback_dialog(ctx: &mut CommandContext) {
                         close_fallback_dialog(ctx, false);
                     }
                 }
-                slot if slot >= 0 => {
+                slot @ 0.. => {
                     let idx = slot as usize;
                     if idx >= configured_save_count(ctx, false) {
                         open_save_load_fallback(ctx, save, state.page, state.return_kind);

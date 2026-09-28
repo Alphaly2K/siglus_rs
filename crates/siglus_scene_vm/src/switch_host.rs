@@ -67,7 +67,20 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
 
 pub struct SwitchHost {
     host: SiglusHost,
+    frame: u64,
+    /// Frames to save as PNGs (`sdmc:/switch/siglus_rs/dump-frames`, one
+    /// frame number per line; a diagnosis aid).
+    dump_frames: Vec<u64>,
+    /// The global save as last written (`global_save_fingerprint`).
+    global_fingerprint: u64,
 }
+
+/// How often the global save is checked for changes. Nothing else writes
+/// it before the game's own end/return-to-menu, and closing the app from
+/// HOME never gets there: the game would start as on its first boot again.
+const GLOBAL_SAVE_INTERVAL: u64 = 300;
+
+const DUMP_DIR: &str = "sdmc:/switch/siglus_rs/dump";
 
 impl SwitchHost {
     pub fn new(config: SiglusHostConfig, width: u32, height: u32) -> Result<Self> {
@@ -75,19 +88,53 @@ impl SwitchHost {
         let renderer = Renderer::new(width, height)?;
         report_switch_marker(b"siglus_switch: rust renderer-create complete\n\0");
         report_switch_marker(b"siglus_switch: rust host-create begin\n\0");
-        let host = SiglusHost::new_with_renderer_sync(config, renderer)?;
+        let mut host = SiglusHost::new_with_renderer_sync(config, renderer)?;
         report_switch_marker(b"siglus_switch: rust host-create complete\n\0");
-        Ok(Self { host })
+        // The game draws at its own #SCREEN_SIZE; the renderer fits that
+        // into the display (as on the Vita).
+        Self::fit_game_screen(&mut host, width, height);
+        // The loaded global data is the baseline: changes from the first
+        // frames on (the game marks its first boot right away) are written.
+        let global_fingerprint = host.persist_global_if_changed(None);
+        let dump_frames: Vec<u64> = std::fs::read_to_string("sdmc:/switch/siglus_rs/dump-frames")
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect();
+        if !dump_frames.is_empty() {
+            let _ = std::fs::create_dir_all(DUMP_DIR);
+        }
+        Ok(Self {
+            host,
+            frame: 0,
+            dump_frames,
+            global_fingerprint,
+        })
     }
 
     /// Drive one original-engine frame.  The libnx frontend supplies the
     /// elapsed time and maps controller/touch input to the shared VM input API.
     pub fn step(&mut self, dt_ms: u32) -> Result<bool> {
-        self.host.step(dt_ms)
+        if self.dump_frames.contains(&self.frame) {
+            let path = format!("{DUMP_DIR}/frame-{}.png", self.frame);
+            self.host.renderer_mut().dump_next_frame(PathBuf::from(path));
+        }
+        self.frame += 1;
+        let running = self.host.step(dt_ms);
+        if self.frame % GLOBAL_SAVE_INTERVAL == 0 {
+            self.global_fingerprint = self.host.persist_global_if_changed(Some(self.global_fingerprint));
+        }
+        running
     }
 
+    /// The display size changed; the game keeps its own screen size.
     pub fn resize(&mut self, width: u32, height: u32) {
-        self.host.resize(width, height, 1.0);
+        Self::fit_game_screen(&mut self.host, width, height);
+    }
+
+    fn fit_game_screen(host: &mut SiglusHost, width: u32, height: u32) {
+        let (logical_w, logical_h) = host.logical_size();
+        host.resize_with_logical_viewport(width, height, 1.0, logical_w, logical_h, 0, 0, width, height);
     }
 
     pub fn key_down(&mut self, key: VmKey) {
@@ -98,8 +145,16 @@ impl SwitchHost {
         self.host.key_up(key);
     }
 
+    /// A touch at display pixel (x, y), mapped into the letterboxed game
+    /// screen.
     pub fn touch(&mut self, phase: i32, x: f64, y: f64) {
-        self.host.touch(phase, x, y);
+        let [sx, sy, sw, sh] = self.host.renderer_mut().screen_viewport();
+        let (logical_w, logical_h) = self.host.renderer_mut().logical_size();
+        let lx = ((x - f64::from(sx)) * f64::from(logical_w) / f64::from(sw.max(1.0)))
+            .clamp(0.0, f64::from(logical_w) - 1.0);
+        let ly = ((y - f64::from(sy)) * f64::from(logical_h) / f64::from(sh.max(1.0)))
+            .clamp(0.0, f64::from(logical_h) - 1.0);
+        self.host.touch(phase, lx, ly);
     }
 
     pub fn gamepad_button(&mut self, button: u8, down: bool) {
@@ -213,6 +268,9 @@ pub unsafe extern "C" fn siglus_switch_engine_touch(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn siglus_switch_engine_destroy(host: *mut SwitchHost) {
     if !host.is_null() {
-        drop(unsafe { Box::from_raw(host) });
+        let mut host = unsafe { Box::from_raw(host) };
+        let last = host.global_fingerprint;
+        host.host.persist_global_if_changed(Some(last));
+        drop(host);
     }
 }

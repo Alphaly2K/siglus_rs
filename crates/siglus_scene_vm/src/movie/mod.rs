@@ -32,35 +32,108 @@ const MPEG_AUDIO_SEEK_INITIAL_BACKTRACK_BYTES: u64 = 512 * 1024;
 const MPEG_AUDIO_SEEK_MAX_PRIME_BYTES: u64 = 16 * 1024 * 1024;
 const MPEG_VIDEO_SEEK_BACKTRACK_BYTES: u64 = 8 * 1024 * 1024;
 const MPEG_VIDEO_SEEK_FORWARD_PROBE_BYTES: u64 = 1024 * 1024;
+#[cfg(not(target_os = "vita"))]
 const MPEG2_STREAM_CHANNEL_CAPACITY: usize = 4;
+#[cfg(target_os = "vita")]
+const MPEG2_STREAM_CHANNEL_CAPACITY: usize = 1;
 const MPEG2_STREAM_MAX_DRAIN_EVENTS: usize = 8;
+#[cfg(not(target_os = "vita"))]
 const MPEG2_STREAM_FRAME_KEEP: usize = 6;
+#[cfg(target_os = "vita")]
+const MPEG2_STREAM_FRAME_KEEP: usize = 1;
+#[cfg(not(target_os = "vita"))]
 const MPEG2_STREAM_DECODE_LEAD_FRAMES: usize = 3;
-#[cfg(not(target_os = "horizon"))]
-const OMV_STREAM_CHANNEL_CAPACITY: usize = 12;
+#[cfg(target_os = "vita")]
+const MPEG2_STREAM_DECODE_LEAD_FRAMES: usize = 1;
+// Desktop OMV queues: a few frames of lead are enough for a desktop CPU
+// (decoding a 1920x1440 frame takes a few milliseconds), and each frame is
+// 3.5 to 8.6 MiB; GameData's title plays four streams at once.
+#[cfg(not(any(target_os = "horizon", target_os = "vita")))]
+const OMV_STREAM_CHANNEL_CAPACITY: usize = 4;
 #[cfg(target_os = "horizon")]
 const OMV_STREAM_CHANNEL_CAPACITY: usize = 4;
-#[cfg(not(target_os = "horizon"))]
+#[cfg(target_os = "vita")]
+const OMV_STREAM_CHANNEL_CAPACITY: usize = 1;
+#[cfg(not(any(target_os = "horizon", target_os = "vita")))]
 const OMV_STREAM_MAX_DRAIN_EVENTS: usize = 16;
-#[cfg(target_os = "horizon")]
+#[cfg(any(target_os = "horizon", target_os = "vita"))]
 const OMV_STREAM_MAX_DRAIN_EVENTS: usize = 8;
-#[cfg(not(target_os = "horizon"))]
-const OMV_STREAM_FRAME_KEEP: usize = 16;
+#[cfg(not(any(target_os = "horizon", target_os = "vita")))]
+const OMV_STREAM_FRAME_KEEP: usize = 6;
 #[cfg(target_os = "horizon")]
 const OMV_STREAM_FRAME_KEEP: usize = 6;
-const OMV_STREAM_DECODE_LEAD_FRAMES: usize = 4;
-#[cfg(not(target_os = "horizon"))]
-const OMV_LOOP_HEAD_CACHE_MAX_FRAMES: usize = 60;
-#[cfg(target_os = "horizon")]
+#[cfg(target_os = "vita")]
+const OMV_STREAM_FRAME_KEEP: usize = 1;
+#[cfg(not(any(target_os = "vita", feature = "virtual-clock")))]
+const OMV_STREAM_DECODE_LEAD_FRAMES: usize = 2;
+/// Virtual-clock replays decode no frame ahead, so the frame on screen does
+/// not depend on how fast the decoder thread ran.
+#[cfg(all(not(target_os = "vita"), feature = "virtual-clock"))]
+const OMV_STREAM_DECODE_LEAD_FRAMES: usize = 0;
+#[cfg(target_os = "vita")]
+const OMV_STREAM_DECODE_LEAD_FRAMES: usize = 1;
+// A loop restart seeks by the index and decodes again (as on consoles);
+// the few cached head frames only bridge that.
 const OMV_LOOP_HEAD_CACHE_MAX_FRAMES: usize = 4;
-#[cfg(not(target_os = "horizon"))]
-const OMV_LOOP_HEAD_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
-#[cfg(target_os = "horizon")]
+#[cfg(not(target_os = "vita"))]
 const OMV_LOOP_HEAD_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(target_os = "vita")]
+const OMV_LOOP_HEAD_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(not(target_os = "vita"))]
 const WMV_STREAM_CHANNEL_CAPACITY: usize = 8;
+#[cfg(target_os = "vita")]
+const WMV_STREAM_CHANNEL_CAPACITY: usize = 1;
 const WMV_STREAM_MAX_DRAIN_EVENTS: usize = 16;
+#[cfg(not(target_os = "vita"))]
 const WMV_STREAM_FRAME_KEEP: usize = 12;
+#[cfg(target_os = "vita")]
+const WMV_STREAM_FRAME_KEEP: usize = 2;
+#[cfg(not(target_os = "vita"))]
 const WMV_STREAM_DECODE_LEAD_MS: usize = 750;
+#[cfg(target_os = "vita")]
+const WMV_STREAM_DECODE_LEAD_MS: usize = 150;
+
+/// Movie decoding runs below the game thread on PS Vita: with several
+/// 1080p OMV streams (GameData's title menu) the decoders took cores the
+/// script and renderer needed, and a late movie frame costs less than a
+/// late game frame.
+fn lower_worker_thread_priority() {
+    #[cfg(target_os = "vita")]
+    unsafe {
+        unsafe extern "C" {
+            fn sceKernelGetThreadId() -> i32;
+            fn sceKernelGetThreadCurrentPriority() -> i32;
+            fn sceKernelChangeThreadPriority(thid: i32, priority: i32) -> i32;
+        }
+        let current = sceKernelGetThreadCurrentPriority();
+        if current > 0 {
+            // User priorities run from 64 (most urgent) to 191.
+            sceKernelChangeThreadPriority(sceKernelGetThreadId(), (current + 16).min(191));
+        }
+    }
+}
+
+fn movie_output_dimensions(width: u32, height: u32) -> (u32, u32) {
+    #[cfg(target_os = "vita")]
+    {
+        const MAX_WIDTH: u32 = 960;
+        const MAX_HEIGHT: u32 = 544;
+        if width > MAX_WIDTH || height > MAX_HEIGHT {
+            if u64::from(width) * u64::from(MAX_HEIGHT) >= u64::from(height) * u64::from(MAX_WIDTH)
+            {
+                return (
+                    MAX_WIDTH,
+                    ((u64::from(height) * u64::from(MAX_WIDTH) / u64::from(width)) as u32).max(1),
+                );
+            }
+            return (
+                ((u64::from(width) * u64::from(MAX_HEIGHT) / u64::from(height)) as u32).max(1),
+                MAX_HEIGHT,
+            );
+        }
+    }
+    (width, height)
+}
 
 #[derive(Debug, Clone)]
 pub struct MovieInfo {
@@ -100,6 +173,9 @@ pub struct MovieStreamFrame {
     /// has this property even though frame selection itself is PTS ordered.
     pub frame_idx_is_decode_order: bool,
     pub clamped_timer_ms: Option<u64>,
+    /// The video's own size. `frame` can be smaller (Vita decodes to at
+    /// most 960x544), so objects size themselves by this, not by `frame`.
+    pub source_size: Option<(u32, u32)>,
 }
 
 enum Mpeg2StreamEvent {
@@ -137,6 +213,9 @@ struct Mpeg2StreamState {
     audio: Option<MovieAudio>,
     decoded_any_this_poll: bool,
     request_frames: Arc<AtomicUsize>,
+    /// Engine frames since this stream was last polled (Vita eviction).
+    #[cfg(target_os = "vita")]
+    idle_frames: u32,
 }
 
 impl Drop for Mpeg2StreamState {
@@ -196,6 +275,9 @@ struct WmvStreamState {
     audio: Option<MovieAudio>,
     decoded_any_this_poll: bool,
     request_ms: Arc<AtomicUsize>,
+    /// Engine frames since this stream was last polled (Vita eviction).
+    #[cfg(target_os = "vita")]
+    idle_frames: u32,
 }
 
 impl Drop for WmvStreamState {
@@ -262,6 +344,9 @@ struct OmvStreamState {
     /// again; serving its fast-catch-up tail would flash stale dark head
     /// frames. Hold this frame until the stream catches back up.
     held_frame: Option<(usize, Arc<RgbaImage>)>,
+    /// Engine frames since this stream was last polled (Vita eviction).
+    #[cfg(target_os = "vita")]
+    idle_frames: u32,
 }
 
 impl Drop for OmvStreamState {
@@ -332,6 +417,43 @@ pub struct MovieMemoryStats {
 }
 
 impl MovieManager {
+    /// Release decoders whose OBJECT movies are no longer visited by the
+    /// scene. Active streams update their timestamp on every presentation
+    /// poll, so several simultaneous movies remain resident.
+    ///
+    /// Idleness is counted in engine frames (this runs once per frame), not
+    /// wall time: a frame that stalls for seconds (card writes, the
+    /// emulator compiling code) must not evict the movie playing now, which
+    /// then restarts from a seek and on a slow decoder never catches up.
+    #[cfg(target_os = "vita")]
+    pub fn evict_idle_streams(&mut self) {
+        const IDLE_FRAMES: u32 = 120;
+        let old_mpeg_count = self.mpeg2_streams.len();
+        let old_wmv_count = self.wmv_streams.len();
+        let keep = |idle: &mut u32| {
+            *idle = idle.saturating_add(1);
+            *idle <= IDLE_FRAMES
+        };
+        self.mpeg2_streams
+            .retain(|_, state| keep(&mut state.idle_frames));
+        self.wmv_streams
+            .retain(|_, state| keep(&mut state.idle_frames));
+        self.omv_streams
+            .retain(|_, state| keep(&mut state.idle_frames));
+        if self.mpeg2_streams.len() != old_mpeg_count {
+            self.mpeg2_audio_tasks
+                .retain(|path, _| self.mpeg2_streams.contains_key(path));
+            self.mpeg2_audio_cache
+                .retain(|path, _| self.mpeg2_streams.contains_key(path));
+        }
+        if self.wmv_streams.len() != old_wmv_count {
+            self.wmv_audio_tasks
+                .retain(|path, _| self.wmv_streams.contains_key(path));
+            self.wmv_audio_cache
+                .retain(|path, _| self.wmv_streams.contains_key(path));
+        }
+    }
+
     /// HUD-only accounting of decoded movie data owned by MovieManager.
     /// This deliberately performs the cache walk only when the caller asks.
     pub fn debug_memory_stats(&self) -> MovieMemoryStats {
@@ -461,6 +583,17 @@ impl MovieManager {
         self.wmv_streams.clear();
         self.wmv_audio_tasks.clear();
         self.omv_streams.clear();
+        #[cfg(target_os = "vita")]
+        {
+            // The desktop cache favors replay latency. On Vita, retaining
+            // decoded frames and whole-track PCM after playback can exhaust
+            // user memory as the scenario visits more movies.
+            self.cache.clear();
+            self.preview_cache.clear();
+            self.decode_tasks.clear();
+            self.mpeg2_audio_cache.clear();
+            self.wmv_audio_cache.clear();
+        }
     }
 
     pub fn prepare(&mut self, file_name: &str) -> Result<MovieInfo> {
@@ -626,6 +759,7 @@ impl MovieManager {
                 let (tx, rx) = mpsc::channel();
                 let worker_path = path.clone();
                 thread::spawn(move || {
+                    lower_worker_thread_priority();
                     let result =
                         decode_asset_for_path(&worker_path).map_err(|e| format!("{:#}", e));
                     let _ = tx.send(result);
@@ -746,6 +880,7 @@ impl MovieManager {
             decoded_now,
             frame_idx_is_decode_order: false,
             clamped_timer_ms: None,
+            source_size: asset.info.width.zip(asset.info.height),
         }))
     }
 
@@ -783,6 +918,10 @@ impl MovieManager {
             .mpeg2_streams
             .get_mut(&path)
             .expect("mpeg2 stream state exists");
+        #[cfg(target_os = "vita")]
+        {
+            state.idle_frames = 0;
+        }
         state.last_requested_timer_ms = timer_ms;
         let request_until = desired_frame_idx
             .unwrap_or(0)
@@ -838,6 +977,7 @@ impl MovieManager {
             decoded_now,
             frame_idx_is_decode_order: false,
             clamped_timer_ms: None,
+            source_size: state.width.zip(state.height),
         }))
     }
 
@@ -866,6 +1006,7 @@ impl MovieManager {
             let worker_cancel = cancel.clone();
             let worker_path = path.to_path_buf();
             thread::spawn(move || {
+                lower_worker_thread_priority();
                 let result = decode_mpeg2_audio_for_path(&worker_path, worker_cancel.as_ref())
                     .map_err(|err| format!("{:#}", err));
                 let _ = tx.send(result);
@@ -957,6 +1098,10 @@ impl MovieManager {
             .wmv_streams
             .get_mut(&path)
             .expect("wmv stream state exists");
+        #[cfg(target_os = "vita")]
+        {
+            state.idle_frames = 0;
+        }
         state.last_effective_timer_ms = effective_timer_ms;
         let request_ms = effective_timer_ms
             .saturating_add(WMV_STREAM_DECODE_LEAD_MS as u64)
@@ -1026,6 +1171,7 @@ impl MovieManager {
             decoded_now,
             frame_idx_is_decode_order: true,
             clamped_timer_ms: loop_flag.then_some(effective_timer_ms),
+            source_size: state.width.zip(state.height),
         }))
     }
 
@@ -1051,6 +1197,7 @@ impl MovieManager {
             let worker_cancel = cancel.clone();
             let worker_path = path.to_path_buf();
             thread::spawn(move || {
+                lower_worker_thread_priority();
                 let result = decode_wmv_audio_for_path(&worker_path, worker_cancel.as_ref())
                     .map_err(|err| format!("{:#}", err));
                 let _ = tx.send(result);
@@ -1085,6 +1232,12 @@ impl MovieManager {
         if !self.omv_streams.contains_key(&path) {
             let state = spawn_omv_stream_state(path.clone())?;
             self.omv_streams.insert(path.clone(), state);
+        }
+        #[cfg(feature = "virtual-clock")]
+        if let Some(state) = self.omv_streams.get_mut(&path) {
+            settle_omv_stream(&path, state, None, |state| {
+                state.fps.is_some() || state.frame_times.is_some()
+            })?;
         }
 
         let effective_timer_ms = self
@@ -1125,6 +1278,10 @@ impl MovieManager {
             .omv_streams
             .get_mut(&path)
             .expect("omv stream state exists");
+        #[cfg(target_os = "vita")]
+        {
+            state.idle_frames = 0;
+        }
         let timer_rewound = effective_timer_ms < state.last_effective_timer_ms.saturating_sub(200);
         state.last_effective_timer_ms = effective_timer_ms;
         let desired_before_drain = if timer_rewound {
@@ -1141,7 +1298,19 @@ impl MovieManager {
         state
             .request_frame
             .store(requested_frame, Ordering::Release);
-        drain_omv_stream_state(path.as_path(), state, desired_before_drain, false, true)?;
+        drain_omv_stream_state(
+            path.as_path(),
+            state,
+            desired_before_drain,
+            false,
+            !cfg!(target_os = "vita"),
+        )?;
+        #[cfg(feature = "virtual-clock")]
+        if let Some(desired) = desired_before_drain {
+            settle_omv_stream(&path, state, desired_before_drain, |state| {
+                state.frames.back().is_some_and(|(idx, _)| *idx >= desired)
+            })?;
+        }
 
         let has_loop_head = loop_flag && !state.loop_head_frames.is_empty();
         if state.frames.is_empty() && !has_loop_head {
@@ -1213,6 +1382,7 @@ impl MovieManager {
             decoded_now: false,
             frame_idx_is_decode_order: false,
             clamped_timer_ms: None,
+            source_size: state.width.zip(state.height),
         }))
     }
 
@@ -1494,12 +1664,14 @@ fn spawn_mpeg2_stream_state(
     let worker_request_frames = request_frames.clone();
     let video_path = path.clone();
     thread::spawn(move || {
+        lower_worker_thread_priority();
         let result = stream_mpeg2_video_worker(
             video_path.as_path(),
             tx.clone(),
             worker_request_frames,
             start_offset,
             initial_frame_idx,
+            first_video_pts_90k,
         );
         if let Err(err) = result {
             let _ = tx.send(Err(format!("{:#}", err)));
@@ -1520,6 +1692,8 @@ fn spawn_mpeg2_stream_state(
         audio,
         decoded_any_this_poll: false,
         request_frames,
+        #[cfg(target_os = "vita")]
+        idle_frames: 0,
     })
 }
 
@@ -1543,7 +1717,14 @@ fn estimate_mpeg_video_seek_offset(
     let file_len = fs::metadata(path)
         .with_context(|| format!("stat movie file: {}", path.display()))?
         .len();
-    let duration_ms = audio.and_then(|track| track.duration_ms).unwrap_or(0);
+    // Without the decoded audio track (not kept on Vita), the duration comes
+    // from the last video timestamp in the file; seeking to 0 instead would
+    // leave a slow decoder behind the clock for the rest of the movie.
+    let duration_ms = audio
+        .and_then(|track| track.duration_ms)
+        .or_else(|| probe_mpeg_video_duration_ms(path))
+        .unwrap_or(0);
+
     if file_len <= MPEG2_STREAM_CHUNK_BYTES as u64 || duration_ms == 0 {
         return Ok(0);
     }
@@ -1581,12 +1762,15 @@ fn estimate_mpeg_video_seek_offset(
     }
 
     let target_in_probe = proportional.saturating_sub(region_start) as usize;
+    // Start at a sequence header or, in files with only one (common for
+    // MPEG-1), at a GOP: the worker gives the decoder the file's sequence
+    // header first (see `mpeg_sequence_header_es`).
     let sequence_pos =
-        rfind_byte_pattern_before(&probe, b"\0\0\x01\xb3", target_in_probe.min(probe.len()));
+        rfind_byte_pattern_before(&probe, b"\0\0\x01\xb3", target_in_probe.min(probe.len()))
+            .or_else(|| {
+                rfind_byte_pattern_before(&probe, b"\0\0\x01\xb8", target_in_probe.min(probe.len()))
+            });
     let Some(sequence_pos) = sequence_pos else {
-        // Without a sequence header before the target, a mid-stream decoder
-        // cannot reconstruct reference pictures safely. Fall back to the
-        // beginning instead of displaying a future GOP.
         return Ok(0);
     };
 
@@ -1622,6 +1806,54 @@ fn estimate_mpeg_video_seek_offset(
     Ok(region_start.saturating_add(pack_pos as u64))
 }
 
+/// The video elementary-stream bytes of the file's first sequence header
+/// (with its extensions), up to the first GOP or picture.
+fn mpeg_sequence_header_es(head: &[u8]) -> Option<Vec<u8>> {
+    let mut demux = na_mpeg2_decoder::Demuxer::new_auto();
+    let es: Vec<u8> = demux
+        .push(head, None)
+        .into_iter()
+        .filter(|packet| packet.stream_type == na_mpeg2_decoder::StreamType::MpegVideo)
+        .flat_map(|packet| packet.data.to_vec())
+        .collect();
+    let start = es.windows(4).position(|w| w == b"\0\0\x01\xb3")?;
+    let end = es[start + 4..]
+        .windows(4)
+        .position(|w| w[..3] == [0, 0, 1] && (w[3] == 0xb8 || w[3] == 0x00))
+        .map(|at| start + 4 + at)?;
+    Some(es[start..end].to_vec())
+}
+
+/// The span between the first and last video timestamps of an MPEG file,
+/// from its head and last MiB.
+fn probe_mpeg_video_duration_ms(path: &Path) -> Option<u64> {
+    const TAIL_BYTES: u64 = 1024 * 1024;
+    let head = read_file_prefix(path, MPEG2_HEADER_PROBE_BYTES).ok()?;
+    let first = probe_first_video_pts_90k(&head)?;
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    // Begin at a pack (program stream) or packet sync (transport stream).
+    let sync = if is_transport_stream_prefix(&head) {
+        tail.iter().position(|&b| b == 0x47).unwrap_or(0)
+    } else {
+        tail.windows(4)
+            .position(|w| w == b"\0\0\x01\xba")
+            .unwrap_or(0)
+    };
+    let mut demux = na_mpeg2_decoder::Demuxer::new_auto();
+    let last = demux
+        .push(&tail[sync..], None)
+        .into_iter()
+        .filter(|packet| packet.stream_type == na_mpeg2_decoder::StreamType::MpegVideo)
+        .filter_map(|packet| packet.pts_90k)
+        .max()?;
+    (last > first).then(|| ((last - first) / 90) as u64)
+}
+
 fn rfind_byte_pattern_before(haystack: &[u8], needle: &[u8], end: usize) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
@@ -1650,6 +1882,7 @@ fn stream_mpeg2_video_worker(
     request_frames: Arc<AtomicUsize>,
     start_offset: u64,
     initial_frame_idx: usize,
+    #[allow(unused_variables)] video_origin_pts_90k: Option<i64>,
 ) -> Result<()> {
     let prefix = read_file_prefix(path, MPEG2_HEADER_PROBE_BYTES)?;
     let mut width = None;
@@ -1674,9 +1907,18 @@ fn stream_mpeg2_video_worker(
             .with_context(|| format!("seek movie video: {}", path.display()))?;
     }
     let mut pipeline = na_mpeg2_decoder::MpegVideoPipeline::new();
+    if start_offset > 0
+        && let Some(header) = mpeg_sequence_header_es(&prefix)
+    {
+        // Starting mid-file: the decoder needs the sequence header, which a
+        // file may carry only at its start.
+        let _ = pipeline.decoder_mut().decode_shared(&header, None);
+    }
     let mut buf = vec![0u8; MPEG2_STREAM_CHUNK_BYTES];
     let mut frame_idx = initial_frame_idx;
     let mut send_failed = false;
+    #[cfg(target_os = "vita")]
+    let mut sent_video = false;
 
     loop {
         let n = file
@@ -1695,10 +1937,25 @@ fn stream_mpeg2_video_worker(
                     send_failed = true;
                     return;
                 }
+                #[cfg(target_os = "vita")]
+                if sent_video
+                    && vita_mpeg_frame_is_late(
+                        f.pts_90k,
+                        video_origin_pts_90k,
+                        fps,
+                        request_frames.load(Ordering::Acquire),
+                    )
+                {
+                    frame_idx = frame_idx.saturating_add(1);
+                    return;
+                }
                 let w = f.width as u32;
                 let h = f.height as u32;
+                let (w, h) = movie_output_dimensions(w, h);
                 let mut rgba = vec![0u8; (w as usize).saturating_mul(h as usize).saturating_mul(4)];
-                na_mpeg2_decoder::frame_to_rgba_bt601_limited(&f, &mut rgba);
+                na_mpeg2_decoder::frame_to_rgba_bt601_limited_scaled(
+                    &f, &mut rgba, w as usize, h as usize,
+                );
                 let frame = Arc::new(RgbaImage {
                     width: w,
                     height: h,
@@ -1714,6 +1971,11 @@ fn stream_mpeg2_video_worker(
                 frame_idx = frame_idx.saturating_add(1);
                 if tx.send(Ok(ev)).is_err() {
                     send_failed = true;
+                } else {
+                    #[cfg(target_os = "vita")]
+                    {
+                        sent_video = true;
+                    }
                 }
             })
             .context("mpeg2 stream video decode")?;
@@ -1731,10 +1993,23 @@ fn stream_mpeg2_video_worker(
             send_failed = true;
             return;
         }
+        #[cfg(target_os = "vita")]
+        if sent_video
+            && vita_mpeg_frame_is_late(
+                f.pts_90k,
+                video_origin_pts_90k,
+                fps,
+                request_frames.load(Ordering::Acquire),
+            )
+        {
+            frame_idx = frame_idx.saturating_add(1);
+            return;
+        }
         let w = f.width as u32;
         let h = f.height as u32;
+        let (w, h) = movie_output_dimensions(w, h);
         let mut rgba = vec![0u8; (w as usize).saturating_mul(h as usize).saturating_mul(4)];
-        na_mpeg2_decoder::frame_to_rgba_bt601_limited(&f, &mut rgba);
+        na_mpeg2_decoder::frame_to_rgba_bt601_limited_scaled(&f, &mut rgba, w as usize, h as usize);
         let frame = Arc::new(RgbaImage {
             width: w,
             height: h,
@@ -1757,6 +2032,23 @@ fn stream_mpeg2_video_worker(
         let _ = tx.send(Ok(Mpeg2StreamEvent::Done));
     }
     Ok(())
+}
+
+#[cfg(target_os = "vita")]
+fn vita_mpeg_frame_is_late(
+    pts_90k: Option<i64>,
+    origin_90k: Option<i64>,
+    fps: Option<f32>,
+    request_until: usize,
+) -> bool {
+    let (Some(pts), Some(origin), Some(fps)) = (pts_90k, origin_90k, fps) else {
+        return false;
+    };
+    if fps <= 0.0 || request_until == usize::MAX {
+        return false;
+    }
+    let frame_index = ((pts.saturating_sub(origin).max(0) as f64) * fps as f64 / 90_000.0) as usize;
+    frame_index.saturating_add(4) < request_until.saturating_sub(MPEG2_STREAM_DECODE_LEAD_FRAMES)
 }
 
 fn drain_mpeg2_stream_state(
@@ -2007,6 +2299,7 @@ fn spawn_wmv_stream_state(
     let worker_request_ms = request_ms.clone();
     let worker_path = path.clone();
     thread::spawn(move || {
+        lower_worker_thread_priority();
         let result = stream_wmv_video_worker(worker_path.as_path(), tx.clone(), worker_request_ms);
         if let Err(err) = result {
             let _ = tx.send(Err(format!("{:#}", err)));
@@ -2029,6 +2322,8 @@ fn spawn_wmv_stream_state(
         audio,
         decoded_any_this_poll: false,
         request_ms,
+        #[cfg(target_os = "vita")]
+        idle_frames: 0,
     })
 }
 
@@ -2052,7 +2347,7 @@ fn stream_wmv_video_worker(
         return Ok(());
     }
 
-    let trace = std::env::var_os("SG_MOVIE_TRACE").is_some();
+    let trace = env_is_set!("SG_MOVIE_TRACE");
     if trace {
         eprintln!(
             "[SG_MOVIE_TRACE][WMV] decoder.open path={} size={}x{}",
@@ -2265,12 +2560,14 @@ fn wmv_yuv_frame_to_rgba(frame: &wmv_decoder::YuvFrame) -> RgbaImage {
     // The original desktop engine delegates WMV presentation to the Windows
     // media stack. For WMV streams without explicit matrix metadata, match the
     // Windows/DXVA fallback: BT.601 for <=576-line SD, BT.709 for HD.
+    let (width, height) = movie_output_dimensions(frame.width, frame.height);
+    let rgba = wmv_decoder::yuv420p_to_rgba_scaled(frame, width, height);
     RgbaImage {
-        width: frame.width,
-        height: frame.height,
+        width,
+        height,
         center_x: 0,
         center_y: 0,
-        rgba: wmv_decoder::yuv420p_to_rgba(frame),
+        rgba,
     }
 }
 
@@ -2279,6 +2576,7 @@ fn spawn_omv_stream_state(path: PathBuf) -> Result<OmvStreamState> {
     let request_frame = Arc::new(AtomicUsize::new(0));
     let worker_request_frame = request_frame.clone();
     thread::spawn(move || {
+        lower_worker_thread_priority();
         let result = stream_omv_video_worker(path.as_path(), tx.clone(), worker_request_frame);
         if let Err(err) = result {
             let _ = tx.send(Err(format!("{:#}", err)));
@@ -2302,6 +2600,8 @@ fn spawn_omv_stream_state(path: PathBuf) -> Result<OmvStreamState> {
         last_served_frame_idx: 0,
         last_effective_timer_ms: 0,
         held_frame: None,
+        #[cfg(target_os = "vita")]
+        idle_frames: 0,
     })
 }
 
@@ -2352,6 +2652,7 @@ fn stream_omv_video_worker(
         .map(|(_, end)| *end)
         .filter(|end| *end > 0);
     let theora_type = omv.header.theora_type;
+    let mut pool = OmvFramePool::default();
 
     if tx
         .send(Ok(OmvStreamEvent::Info {
@@ -2434,6 +2735,7 @@ fn stream_omv_video_worker(
             if let Some(buf) = packed
                 && !send_omv_video_frame(
                     &tx,
+                    &mut pool,
                     target_frame,
                     &buf,
                     vinfo,
@@ -2465,7 +2767,18 @@ fn stream_omv_video_worker(
             if request_frame.load(Ordering::Acquire) == usize::MAX {
                 return Ok(());
             }
-            let Some(buf) = video_tf.read_video_frame()? else {
+            let Some(frame) = video_tf.read_video_frame_with(|ycbcr| {
+                omv_rgba_frame(
+                    &DecoderOmvPlanes(ycbcr),
+                    vinfo,
+                    display_h,
+                    theora_type,
+                    width,
+                    height,
+                    &mut pool,
+                )
+            })?
+            else {
                 if !eof_reported {
                     if tx.send(Ok(OmvStreamEvent::Done)).is_err() {
                         return Ok(());
@@ -2474,16 +2787,13 @@ fn stream_omv_video_worker(
                 }
                 break;
             };
-            if !send_omv_video_frame(
-                &tx,
-                next_frame_idx,
-                &buf,
-                vinfo,
-                display_h,
-                theora_type,
-                width,
-                height,
-            )? {
+            if tx
+                .send(Ok(OmvStreamEvent::Video {
+                    frame_idx: next_frame_idx,
+                    frame,
+                }))
+                .is_err()
+            {
                 return Ok(());
             }
             next_frame_idx = next_frame_idx.saturating_add(1);
@@ -2524,6 +2834,7 @@ fn omv_should_index_seek(
 
 fn send_omv_video_frame(
     tx: &mpsc::SyncSender<Result<OmvStreamEvent, String>>,
+    pool: &mut OmvFramePool,
     frame_idx: usize,
     buf: &[u8],
     vinfo: siglus_omv_decoder::VideoInfo,
@@ -2532,25 +2843,89 @@ fn send_omv_video_frame(
     width: u32,
     height: u32,
 ) -> Result<bool> {
-    let rgba = convert_omv_frame(
-        buf,
+    let (uv_w, _uv_h, y_plane_len, u_plane_len, _v_plane_len) =
+        omv_plane_layout(vinfo.frame_width, vinfo.frame_height, vinfo.fmt);
+    let planes = PackedOmvPlanes {
+        data: buf,
+        offsets: [0, y_plane_len, y_plane_len.saturating_add(u_plane_len)],
+        widths: [vinfo.frame_width.max(1) as usize, uv_w, uv_w],
+    };
+    let frame = omv_rgba_frame(&planes, vinfo, display_h, theora_type, width, height, pool);
+    Ok(tx
+        .send(Ok(OmvStreamEvent::Video { frame_idx, frame }))
+        .is_ok())
+}
+
+/// One OMV frame converted for display (downscaled on consoles, see
+/// `movie_output_dimensions`).
+fn omv_rgba_frame(
+    planes: &impl OmvPlanes,
+    vinfo: siglus_omv_decoder::VideoInfo,
+    display_h: i32,
+    theora_type: u32,
+    width: u32,
+    height: u32,
+    pool: &mut OmvFramePool,
+) -> Arc<RgbaImage> {
+    let (output_width, output_height) = movie_output_dimensions(width, height);
+    let mut frame = pool.take().unwrap_or_else(|| {
+        Arc::new(RgbaImage {
+            width: 0,
+            height: 0,
+            center_x: 0,
+            center_y: 0,
+            rgba: Vec::new(),
+        })
+    });
+    let image = Arc::get_mut(&mut frame).expect("a pooled frame is held only by the pool");
+    convert_omv_planes_into(
+        planes,
         vinfo.frame_width,
         vinfo.frame_height,
         vinfo.fmt,
         width as i32,
         display_h,
         theora_type,
+        output_width as usize,
+        output_height as usize,
+        &mut image.rgba,
     );
-    let frame = Arc::new(RgbaImage {
-        width,
-        height,
-        center_x: 0,
-        center_y: 0,
-        rgba,
-    });
-    Ok(tx
-        .send(Ok(OmvStreamEvent::Video { frame_idx, frame }))
-        .is_ok())
+    image.width = output_width;
+    image.height = output_height;
+    pool.track(&frame);
+    frame
+}
+
+/// The frames an OMV worker sent, so that one the engine has let go of is
+/// decoded into again instead of allocating a new frame (3.5 MiB at 720p,
+/// 8.6 MiB for a 1920x1440 OMV, for every frame).
+#[derive(Default)]
+struct OmvFramePool {
+    sent: VecDeque<Arc<RgbaImage>>,
+}
+
+impl OmvFramePool {
+    /// Frames followed; older ones are forgotten (they are freed as before).
+    const MAX_TRACKED: usize = 64;
+
+    /// A frame nothing but the pool holds any more. The other released
+    /// frames are freed, so no more memory is kept than before.
+    fn take(&mut self) -> Option<Arc<RgbaImage>> {
+        let unique = |frame: &Arc<RgbaImage>| {
+            Arc::strong_count(frame) == 1 && Arc::weak_count(frame) == 0
+        };
+        let index = self.sent.iter().position(unique)?;
+        let frame = self.sent.remove(index);
+        self.sent.retain(|frame| !unique(frame));
+        frame
+    }
+
+    fn track(&mut self, frame: &Arc<RgbaImage>) {
+        self.sent.push_back(frame.clone());
+        if self.sent.len() > Self::MAX_TRACKED {
+            self.sent.pop_front();
+        }
+    }
 }
 
 fn select_stream_frame(
@@ -2634,6 +3009,34 @@ fn cache_omv_loop_head_frame(state: &mut OmvStreamState, frame_idx: usize, frame
     state.loop_head_bytes = state.loop_head_bytes.saturating_add(frame_bytes);
     state.loop_head_frames.push_back((frame_idx, frame.clone()));
 }
+
+/// Virtual-clock replays only: waits (on the real clock) until the decoder
+/// thread has delivered what a fast machine would have by now, so the frame
+/// shown does not depend on thread timing.
+#[cfg(feature = "virtual-clock")]
+fn settle_omv_stream(
+    path: &Path,
+    state: &mut OmvStreamState,
+    target_frame_idx: Option<usize>,
+    ready: impl Fn(&OmvStreamState) -> bool,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(5);
+    while !ready(state) && !state.done && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        drain_omv_stream_state(path, state, target_frame_idx, false, true)?;
+    }
+    OMV_SETTLE_NS.fetch_add(
+        start.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    Ok(())
+}
+
+/// Real time spent in `settle_omv_stream` (replays leave it out of the VM's
+/// time).
+#[cfg(feature = "virtual-clock")]
+pub static OMV_SETTLE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn drain_omv_stream_state(
     path: &Path,
@@ -3939,8 +4342,11 @@ fn decode_mpeg2_preview_frame(path: &Path) -> Result<Arc<RgbaImage>> {
                     if first.is_none() {
                         let w = f.width as u32;
                         let h = f.height as u32;
+                        let (w, h) = movie_output_dimensions(w, h);
                         let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
-                        na_mpeg2_decoder::frame_to_rgba_bt601_limited(&f, &mut rgba);
+                        na_mpeg2_decoder::frame_to_rgba_bt601_limited_scaled(
+                            &f, &mut rgba, w as usize, h as usize,
+                        );
                         first = Some(Arc::new(RgbaImage {
                             width: w,
                             height: h,
@@ -3960,8 +4366,11 @@ fn decode_mpeg2_preview_frame(path: &Path) -> Result<Arc<RgbaImage>> {
                 if first.is_none() {
                     let w = f.width as u32;
                     let h = f.height as u32;
+                    let (w, h) = movie_output_dimensions(w, h);
                     let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
-                    na_mpeg2_decoder::frame_to_rgba_bt601_limited(&f, &mut rgba);
+                    na_mpeg2_decoder::frame_to_rgba_bt601_limited_scaled(
+                        &f, &mut rgba, w as usize, h as usize,
+                    );
                     first = Some(Arc::new(RgbaImage {
                         width: w,
                         height: h,
@@ -4004,7 +4413,8 @@ fn decode_omv_preview_frame(path: &Path) -> Result<Arc<RgbaImage>> {
         let display_h = omv.header.display_height as i32;
         let width = omv.header.display_width.max(1);
         let height = display_h.max(1) as u32;
-        let rgba = convert_omv_frame(
+        let (output_width, output_height) = movie_output_dimensions(width, height);
+        let rgba = convert_omv_frame_to_size(
             &packed,
             vinfo.frame_width,
             vinfo.frame_height,
@@ -4012,10 +4422,12 @@ fn decode_omv_preview_frame(path: &Path) -> Result<Arc<RgbaImage>> {
             width as i32,
             display_h,
             omv.header.theora_type,
+            output_width as usize,
+            output_height as usize,
         );
         Ok(Arc::new(RgbaImage {
-            width,
-            height,
+            width: output_width,
+            height: output_height,
             center_x: 0,
             center_y: 0,
             rgba,
@@ -4572,9 +4984,7 @@ fn build_mpeg2_audio_timeline(
         samples.extend_from_slice(&converted);
     }
 
-    if (std::env::var_os("SG_MOVIE_TRACE").is_some() || std::env::var_os("SG_DEBUG").is_some())
-        && discontinuity_count > 0
-    {
+    if (env_is_set!("SG_MOVIE_TRACE") || env_is_set!("SG_DEBUG")) && discontinuity_count > 0 {
         eprintln!(
             "[SG_DEBUG][MOV] audio_pts.contiguous path={} anchors_over_tolerance={} max_drift_frames={} max_drift_ms={}",
             path.display(),
@@ -4830,33 +5240,230 @@ fn convert_omv_frame(
     display_height: i32,
     theora_type: u32,
 ) -> Vec<u8> {
+    convert_omv_frame_to_size(
+        data,
+        frame_width,
+        frame_height,
+        fmt,
+        display_width,
+        display_height,
+        theora_type,
+        display_width.max(1) as usize,
+        display_height.max(1) as usize,
+    )
+}
+
+fn convert_omv_frame_to_size(
+    data: &[u8],
+    frame_width: i32,
+    frame_height: i32,
+    fmt: i32,
+    display_width: i32,
+    display_height: i32,
+    theora_type: u32,
+    output_width: usize,
+    output_height: usize,
+) -> Vec<u8> {
     // tona3 does not apply Theora pic_x/pic_y to OMV video. It asks
     // th_decode_ycbcr_out() for the decoded planes, starts at plane.data, and
     // advances each row by the plane stride while using the OMV header's
     // theora_size as the visible rectangle. `data` is the same set of full
     // decoded planes repacked tightly, so frame_width/frame_height are the
     // source strides here and display_width/display_height are the output size.
+    let (uv_w, _uv_h, y_plane_len, u_plane_len, _v_plane_len) =
+        omv_plane_layout(frame_width, frame_height, fmt);
+    let planes = PackedOmvPlanes {
+        data,
+        offsets: [0, y_plane_len, y_plane_len.saturating_add(u_plane_len)],
+        widths: [frame_width.max(1) as usize, uv_w, uv_w],
+    };
+    convert_omv_planes_to_size(
+        &planes,
+        frame_width,
+        frame_height,
+        fmt,
+        display_width,
+        display_height,
+        theora_type,
+        output_width,
+        output_height,
+    )
+}
+
+/// Decoded OMV planes (Y/B, U/G, V/R) for `convert_omv_planes_to_size`.
+trait OmvPlanes {
+    /// Plane `pli`'s sample at (`x`, `y`), or `default` outside it.
+    fn sample(&self, pli: usize, x: usize, y: usize, default: u8) -> u8;
+
+    /// Row `y` of plane `pli` as `len` bytes, when byte `x` of it is
+    /// `sample(pli, x, y, _)` for every `x < len` (None otherwise).
+    fn row(&self, pli: usize, y: usize, len: usize) -> Option<&[u8]>;
+}
+
+/// The planes repacked tightly one after another (worker messages).
+struct PackedOmvPlanes<'a> {
+    data: &'a [u8],
+    offsets: [usize; 3],
+    widths: [usize; 3],
+}
+
+impl OmvPlanes for PackedOmvPlanes<'_> {
+    fn sample(&self, pli: usize, x: usize, y: usize, default: u8) -> u8 {
+        get_plane_sample(
+            self.data,
+            self.offsets[pli],
+            self.widths[pli],
+            x,
+            y,
+            default,
+        )
+    }
+
+    fn row(&self, pli: usize, y: usize, len: usize) -> Option<&[u8]> {
+        let width = self.widths[pli];
+        if width == 0 {
+            return None;
+        }
+        let start = self.offsets[pli].checked_add(y.checked_mul(width)?)?;
+        self.data.get(start..start.checked_add(len)?)
+    }
+}
+
+/// The planes as the Theora decoder holds them (no repacked copy: at
+/// 1920x1440 4:4:4 that was 8 MiB per frame per stream).
+struct DecoderOmvPlanes<'a>(&'a siglus_omv_decoder::YCbCrRef<'a>);
+
+impl OmvPlanes for DecoderOmvPlanes<'_> {
+    fn sample(&self, pli: usize, x: usize, y: usize, default: u8) -> u8 {
+        let plane = &self.0[pli];
+        let (width, height) = (plane.width.max(0) as usize, plane.height.max(0) as usize);
+        if x >= width || y >= height {
+            return default;
+        }
+        let index = plane.data_offset as isize + y as isize * plane.stride as isize + x as isize;
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| plane.data.get(index))
+            .copied()
+            .unwrap_or(default)
+    }
+
+    fn row(&self, pli: usize, y: usize, len: usize) -> Option<&[u8]> {
+        let plane = &self.0[pli];
+        if len > plane.width.max(0) as usize || y >= plane.height.max(0) as usize {
+            return None;
+        }
+        let start = plane.data_offset as isize + y as isize * plane.stride as isize;
+        let start = usize::try_from(start).ok()?;
+        plane.data.get(start..start.checked_add(len)?)
+    }
+}
+
+fn bilinear_omv_sample(
+    planes: &impl OmvPlanes,
+    pli: usize,
+    x: (usize, usize, u32),
+    y: (usize, usize, u32),
+    default: u8,
+) -> u8 {
+    let (x0, x1, fx) = x;
+    let (y0, y1, fy) = y;
+    let p00 = u64::from(planes.sample(pli, x0, y0, default));
+    let p10 = u64::from(planes.sample(pli, x1, y0, default));
+    let p01 = u64::from(planes.sample(pli, x0, y1, default));
+    let p11 = u64::from(planes.sample(pli, x1, y1, default));
+    const ONE: u64 = 1 << 16;
+    let fx = u64::from(fx);
+    let fy = u64::from(fy);
+    let top = p00 * (ONE - fx) + p10 * fx;
+    let bottom = p01 * (ONE - fx) + p11 * fx;
+    ((top * (ONE - fy) + bottom * fy + (1 << 31)) >> 32) as u8
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn convert_omv_planes_to_size(
+    planes: &impl OmvPlanes,
+    frame_width: i32,
+    frame_height: i32,
+    fmt: i32,
+    display_width: i32,
+    display_height: i32,
+    theora_type: u32,
+    output_width: usize,
+    output_height: usize,
+) -> Vec<u8> {
+    let mut rgba = Vec::new();
+    convert_omv_planes_into(
+        planes,
+        frame_width,
+        frame_height,
+        fmt,
+        display_width,
+        display_height,
+        theora_type,
+        output_width,
+        output_height,
+        &mut rgba,
+    );
+    rgba
+}
+
+/// `convert_omv_planes_to_size` into `rgba` (reused: every pixel is
+/// written, so a buffer of the right size is not cleared first).
+#[allow(clippy::too_many_arguments)]
+fn convert_omv_planes_into(
+    planes: &impl OmvPlanes,
+    frame_width: i32,
+    frame_height: i32,
+    fmt: i32,
+    display_width: i32,
+    display_height: i32,
+    theora_type: u32,
+    output_width: usize,
+    output_height: usize,
+    rgba: &mut Vec<u8>,
+) {
     let sw = frame_width.max(1) as usize;
     let sh = frame_height.max(1) as usize;
     let dw = display_width.max(1) as usize;
     let dh = display_height.max(1) as usize;
+    let (uv_w, uv_h) = yuv_plane_size(frame_width, frame_height, fmt);
 
-    let (uv_w, uv_h, y_plane_len, u_plane_len, _v_plane_len) =
-        omv_plane_layout(frame_width, frame_height, fmt);
-    let y_off = 0usize;
-    let u_off = y_off.saturating_add(y_plane_len);
-    let v_off = u_off.saturating_add(u_plane_len);
+    rgba.resize(output_width.saturating_mul(output_height).saturating_mul(4), 0);
+    // Source column of each output column, and how much of a row they
+    // span: rows are then read as slices (per-pixel sampling with a division
+    // and bounds checks took longer than decoding a 1080p frame).
+    let source_x: Vec<usize> = (0..output_width)
+        .map(|out_x| out_x * dw / output_width)
+        .collect();
+    let row_len = source_x.last().map_or(0, |&x| x + 1);
 
-    let mut rgba = vec![0u8; dw.saturating_mul(dh).saturating_mul(4)];
-
-    match theora_type {
-        siglus_assets::omv::OMV_THEORA_TYPE_RGB => {
-            for y in 0..dh {
-                for x in 0..dw {
-                    let b = get_plane_sample(data, y_off, sw, x, y, 0);
-                    let g = get_plane_sample(data, u_off, uv_w, x, y, 0);
-                    let r = get_plane_sample(data, v_off, uv_w, x, y, 0);
-                    let out = (y * dw + x) * 4;
+    match (theora_type, fmt) {
+        (siglus_assets::omv::OMV_THEORA_TYPE_RGB, _) => {
+            for out_y in 0..output_height {
+                let y = out_y * dh / output_height;
+                if let (Some(b_row), Some(g_row), Some(r_row)) = (
+                    planes.row(0, y, row_len),
+                    planes.row(1, y, row_len),
+                    planes.row(2, y, row_len),
+                ) {
+                    let out_row =
+                        &mut rgba[out_y * output_width * 4..(out_y + 1) * output_width * 4];
+                    for (px, &x) in out_row.chunks_exact_mut(4).zip(&source_x) {
+                        px[0] = r_row[x];
+                        px[1] = g_row[x];
+                        px[2] = b_row[x];
+                        px[3] = 0xff;
+                    }
+                    continue;
+                }
+                for out_x in 0..output_width {
+                    let x = out_x * dw / output_width;
+                    let b = planes.sample(0, x, y, 0);
+                    let g = planes.sample(1, x, y, 0);
+                    let r = planes.sample(2, x, y, 0);
+                    let out = (out_y * output_width + out_x) * 4;
                     rgba[out] = r;
                     rgba[out + 1] = g;
                     rgba[out + 2] = b;
@@ -4864,27 +5471,45 @@ fn convert_omv_frame(
                 }
             }
         }
-        siglus_assets::omv::OMV_THEORA_TYPE_RGBA => {
+        (siglus_assets::omv::OMV_THEORA_TYPE_RGBA, _) => {
             // Original layout: visible B/G/R occupy the first `dh` rows of
             // the three 4:4:4 planes. Alpha follows below that visible region:
             // top third in Y, middle third in U, bottom third in V.
             let alpha_h = dh.div_ceil(3);
             let alpha_h_2 = alpha_h * 2;
-            for y in 0..dh {
-                let (a_off, local_y, a_width) = if y < alpha_h {
-                    (y_off, y, sw)
+            for out_y in 0..output_height {
+                let y = out_y * dh / output_height;
+                let (a_pli, local_y) = if y < alpha_h {
+                    (0, y)
                 } else if y < alpha_h_2 {
-                    (u_off, y - alpha_h, uv_w)
+                    (1, y - alpha_h)
                 } else {
-                    (v_off, y - alpha_h_2, uv_w)
+                    (2, y - alpha_h_2)
                 };
                 let alpha_y = dh.saturating_add(local_y);
-                for x in 0..dw {
-                    let b = get_plane_sample(data, y_off, sw, x, y, 0);
-                    let g = get_plane_sample(data, u_off, uv_w, x, y, 0);
-                    let r = get_plane_sample(data, v_off, uv_w, x, y, 0);
-                    let a = get_plane_sample(data, a_off, a_width, x, alpha_y, 0xff);
-                    let out = (y * dw + x) * 4;
+                if let (Some(b_row), Some(g_row), Some(r_row), Some(a_row)) = (
+                    planes.row(0, y, row_len),
+                    planes.row(1, y, row_len),
+                    planes.row(2, y, row_len),
+                    planes.row(a_pli, alpha_y, row_len),
+                ) {
+                    let out_row =
+                        &mut rgba[out_y * output_width * 4..(out_y + 1) * output_width * 4];
+                    for (px, &x) in out_row.chunks_exact_mut(4).zip(&source_x) {
+                        px[0] = r_row[x];
+                        px[1] = g_row[x];
+                        px[2] = b_row[x];
+                        px[3] = a_row[x];
+                    }
+                    continue;
+                }
+                for out_x in 0..output_width {
+                    let x = out_x * dw / output_width;
+                    let b = planes.sample(0, x, y, 0);
+                    let g = planes.sample(1, x, y, 0);
+                    let r = planes.sample(2, x, y, 0);
+                    let a = planes.sample(a_pli, x, alpha_y, 0xff);
+                    let out = (out_y * output_width + out_x) * 4;
                     rgba[out] = r;
                     rgba[out + 1] = g;
                     rgba[out + 2] = b;
@@ -4892,16 +5517,18 @@ fn convert_omv_frame(
                 }
             }
         }
-        _ if fmt == siglus_omv_decoder::TH_PF_444 => {
+        (_, siglus_omv_decoder::TH_PF_444) => {
             // This is the exact tona3 YUV path: all three source planes are
             // sampled at the same x/y and the float result is truncated by the
             // C++ `(int)` cast before clamping.
-            for y in 0..dh {
-                for x in 0..dw {
-                    let yv = get_plane_sample(data, y_off, sw, x, y, 0) as f32;
-                    let u = get_plane_sample(data, u_off, uv_w, x, y, 128) as f32 - 128.0;
-                    let v = get_plane_sample(data, v_off, uv_w, x, y, 128) as f32 - 128.0;
-                    let out = (y * dw + x) * 4;
+            for out_y in 0..output_height {
+                let y = out_y * dh / output_height;
+                for out_x in 0..output_width {
+                    let x = out_x * dw / output_width;
+                    let yv = planes.sample(0, x, y, 0) as f32;
+                    let u = planes.sample(1, x, y, 128) as f32 - 128.0;
+                    let v = planes.sample(2, x, y, 128) as f32 - 128.0;
+                    let out = (out_y * output_width + out_x) * 4;
                     rgba[out] = clamp_f(yv + 1.40200 * v);
                     rgba[out + 1] = clamp_f(yv - 0.34414 * u - 0.71414 * v);
                     rgba[out + 2] = clamp_f(yv + 1.77200 * u);
@@ -4921,19 +5548,17 @@ fn convert_omv_frame(
                 .map(|y| centred_resample_coordinate(y, uv_h, sh))
                 .collect();
 
-            for y in 0..dh {
+            for out_y in 0..output_height {
+                let y = out_y * dh / output_height;
                 let y_coord = chroma_y[y];
-                for x in 0..dw {
-                    let yv = get_plane_sample(data, y_off, sw, x, y, 0) as f32;
+                for out_x in 0..output_width {
+                    let x = out_x * dw / output_width;
+                    let yv = planes.sample(0, x, y, 0) as f32;
                     let x_coord = chroma_x[x];
-                    let u = get_bilinear_plane_sample(data, u_off, uv_w, x_coord, y_coord, 128)
-                        as f32
-                        - 128.0;
-                    let v = get_bilinear_plane_sample(data, v_off, uv_w, x_coord, y_coord, 128)
-                        as f32
-                        - 128.0;
+                    let u = bilinear_omv_sample(planes, 1, x_coord, y_coord, 128) as f32 - 128.0;
+                    let v = bilinear_omv_sample(planes, 2, x_coord, y_coord, 128) as f32 - 128.0;
 
-                    let out = (y * dw + x) * 4;
+                    let out = (out_y * output_width + out_x) * 4;
                     rgba[out] = clamp_f(yv + 1.40200 * v);
                     rgba[out + 1] = clamp_f(yv - 0.34414 * u - 0.71414 * v);
                     rgba[out + 2] = clamp_f(yv + 1.77200 * u);
@@ -4942,8 +5567,6 @@ fn convert_omv_frame(
             }
         }
     }
-
-    rgba
 }
 
 fn get_plane_sample(
@@ -5094,6 +5717,76 @@ mod omv_conversion_parity_tests {
                 16, 6, 255,
             ]
         );
+    }
+
+    /// Converting from the decoder's planes gives the same pixels as the
+    /// repacked copy, full size and downscaled (real OMVs, when present).
+    #[test]
+    fn decoder_planes_convert_like_packed_planes() {
+        use super::{DecoderOmvPlanes, convert_omv_frame_to_size, convert_omv_planes_to_size};
+        let files = [
+            "/Users/xmoe/Documents/GameData/mov/ef_wind_dust01.omv",
+            "/Users/xmoe/Documents/GameData/mov/ef_wind04.omv",
+            "/Users/xmoe/Documents/GameData/mov/ef_fog01.omv",
+            "/Users/xmoe/Documents/RewriteHF/mov/ny_hf_waterscreen.omv",
+        ];
+        for file in files {
+            let path = std::path::Path::new(file);
+            if !path.is_file() {
+                continue;
+            }
+            let omv = siglus_assets::omv::OmvFile::open(path).unwrap();
+            let open = || {
+                siglus_omv_decoder::TheoraVideoStream::open(
+                    omv.open_embedded_ogg_reader(path).unwrap(),
+                )
+                .unwrap()
+            };
+            let (mut packed_stream, mut direct_stream) = (open(), open());
+            let vinfo = packed_stream.info();
+            let width = omv.header.display_width as i32;
+            let height = omv.header.display_height as i32;
+            let theora_type = omv.header.theora_type;
+            let sizes = [
+                (width as usize, height as usize),
+                (width as usize / 2, height as usize / 2),
+            ];
+            for frame in 0..40 {
+                let packed = packed_stream.read_video_frame().unwrap().unwrap();
+                let direct = direct_stream
+                    .read_video_frame_with(|ycbcr| {
+                        sizes.map(|(w, h)| {
+                            convert_omv_planes_to_size(
+                                &DecoderOmvPlanes(ycbcr),
+                                vinfo.frame_width,
+                                vinfo.frame_height,
+                                vinfo.fmt,
+                                width,
+                                height,
+                                theora_type,
+                                w,
+                                h,
+                            )
+                        })
+                    })
+                    .unwrap()
+                    .unwrap();
+                for (i, (w, h)) in sizes.into_iter().enumerate() {
+                    let expected = convert_omv_frame_to_size(
+                        &packed,
+                        vinfo.frame_width,
+                        vinfo.frame_height,
+                        vinfo.fmt,
+                        width,
+                        height,
+                        theora_type,
+                        w,
+                        h,
+                    );
+                    assert!(direct[i] == expected, "{file} frame {frame} at {w}x{h}");
+                }
+            }
+        }
     }
 
     #[test]

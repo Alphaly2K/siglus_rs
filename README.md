@@ -2,21 +2,145 @@
 
 <img src="./icon/Icon.png" alt="icon" align="left" width="100" style="margin-right: 10px;" />
 
-**siglus_rs** is an unofficial Rust implementation and multi-platform port of SiglusEngine.
+**siglus_rs** is an unofficial full Rust reimplementation of **UK2, AVG32, RealLive, and SiglusEngine**, with a primary focus on SiglusEngine.
 
 This project is non-commercial and intended for research purposes.
 
 <br clear="left"/>
 
 ## Example screenshots
-* siglus_rs on macOS
-![On Mac](./images/screenshot.png)
 
-* siglus_rs on iOS
-![On iOS](./images/ios-screenshot.png)
+### UK2 Engine
+**1993–1997 · AyPio**
 
-* siglus_rs on WebAssembly
-![On Web](./images/screenshot-wasm.png)
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <img src="./images/uk2_1.png" width="100%"><br>
+      <b>Sorcer Kingdom</b><br>
+      <sub>Title screen.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="./images/uk2_2.jpeg" width="100%"><br>
+      <b>Sorcer Kingdom</b><br>
+      <sub>Dialogue scene.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="./images/uk2_3.png" width="100%"><br>
+      <b>Sorcer Kingdom</b><br>
+      <sub>Map exploration.</sub>
+    </td>
+  </tr>
+</table>
+
+
+### AVG32
+**1996–2001 · VisualArt's**
+
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <img src="./images/avg32_air_title.png" width="100%"><br>
+      <b>AIR</b><br>
+      <sub>The title of AIR.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="./images/avg32_air_op.png" width="100%"><br>
+      <b>AIR</b><br>
+      <sub>Air opening.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="./images/avg32_kanon.png" width="100%"><br>
+      <b>Kanon</b><br>
+      <sub>Kanon opening.</sub>
+    </td>
+  </tr>
+</table>
+
+
+### RealLive
+**2001–2022 · VisualArt's**
+
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <img src="./images/rl_lb.jpeg" width="100%"><br>
+      <b>Little Busters!</b><br>
+      <sub>A screenshot of Little Busters!</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="./images/rl_game.jpeg" width="100%"><br>
+      <b>Little Busters!</b><br>
+      <sub>The baseball minigame in Little Busters! (implemented in bt00.dll)</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="./images/rl_tomoyo_dt.jpeg" width="100%"><br>
+      <b>Tomoyo After: It's a Wonderful Life</b><br>
+      <sub>The Dungeons & Takafumis minigame in Tomoyo After ~It's a Wonderful Life~ (dt00.dll)</sub>
+    </td>
+  </tr>
+</table>
+
+
+### SiglusEngine
+**2010–now · VisualArt's**
+
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <img src="./images/screenshot.png" width="100%"><br>
+      <b>macOS</b><br>
+      <sub>SiglusEngine running natively on macOS.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="./images/ios-screenshot.png" width="100%"><br>
+      <b>iOS</b><br>
+      <sub>SiglusEngine running on iOS.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="./images/screenshot-wasm.png" width="100%"><br>
+      <b>WebAssembly</b><br>
+      <sub>SiglusEngine running in a web browser.</sub>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <img src="./images/sg_benchmark.png" width="100%"><br>
+      <b>Chihaya Rolling WE</b><br>
+      <sub>Official SiglusEngine benchmark released by Key to measure Rewrite performance.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="./images/sg_summer.png" width="100%"><br>
+      <b>Summer Pockets REFLECTION BLUE</b><br>
+      <sub>Key’s expanded version of Summer Pockets, adding new routes and a new heroine.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="./images/sg_anemoi.png" width="100%"><br>
+      <b>anemoi</b><br>
+      <sub>Key’s 2026 romance adventure title.</sub>
+    </td>
+  </tr>
+</table>
+
+### On game consoles
+
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <img src="./images/psvita.png" width="100%"><br>
+      <b>PS Vita</b><br>
+      <sub>Summer Pockets REFLECTION BLUE for PS Vita.</sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="./images/switch.png" width="100%"><br>
+      <b>Nintendo Switch</b><br>
+      <sub>Anemoi for Nintendo Switch.</sub>
+    </td>
+  </tr>
+</table>
 
 * siglus_rs works on a wide range of platforms, including Windows, Linux, macOS, iOS, Android, and WebAssembly.
 
@@ -29,19 +153,36 @@ This project is non-commercial and intended for research purposes.
 | iOS | arm64 device, arm64 simulator, x86_64 simulator |
 | Android | arm64-v8a, x86_64 |
 | WebAssembly | wasm32-unknown-unknown |
+| PS Vita | armv7 |
+| Nintendo Switch | aarch64 |
+
+The app launchers (macOS bundle, iOS, Android, WebAssembly) import one game or
+many games at once, detect the engine (SiglusEngine, RealLive, AVG32, UK2),
+show cover art or the game icon, and let you pick the text encoding for
+non-Siglus games. See [crates/game_launcher](crates/game_launcher/README.md).
 
 ## Pre-built binaries
 * See preview releases on [GitHub Releases](https://github.com/xmoezzz/siglus_rs/releases)
 
 ## Documentation Availability
 * API documentation is available at [docs](https://xmoezzz.github.io/siglus_rs/)
-* [PS Vita port roadmap](platform/vita/ROADMAP.md) — planned milestones and validation criteria; Vita support is not yet implemented.
+* [PS Vita port](platform/vita/README.md) — experimental SiglusEngine player (`siglus-psvita.vpk` on the releases page); installing it and a game is described there. [Roadmap](platform/vita/ROADMAP.md).
 
 ## Run
 
 ```bash
 cargo run --release -p siglus_scene_vm --bin siglus_engine -- --project-dir ~/Documents/siglus_rs-main/testcase
 ```
+
+Closing the desktop game window prefers the game's own exit confirmation.
+The engine looks for a unique, parameterless exit action in shared script
+commands, the configured cancel-menu scene, and the active title menu's local
+button actions. Title actions are available only after the title buttons are
+ready. Scripts that require EXCALL menu storage, unsupported or ambiguous
+scripts, and already active system menus use the built-in confirmation instead.
+An optional `#CLOSE_SCENE = "scene_name", label` entry in `Gameexe.ini` overrides
+discovery: that scene must handle confirmation and call `syscom.end_game` on
+acceptance; returning resumes the game.
 
 Desktop windows use `icon.png`, `icon.ico`, or the first readable `.ico` file
 (in filename order) from the game directory, falling back to the Siglus icon.

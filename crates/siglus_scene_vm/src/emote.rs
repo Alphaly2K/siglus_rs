@@ -426,3 +426,76 @@ fn decode_rl(bytes: &[u8], align: usize, expected: usize) -> Result<Vec<u8>> {
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod physics_regression_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires SIGLUS_EMOTE_TEST_PROJECT pointing to 神待少女纱波"]
+    fn after_idle_physics_is_continuous_and_mouth_updates_preserve_it() {
+        let project =
+            std::path::PathBuf::from(std::env::var_os("SIGLUS_EMOTE_TEST_PROJECT").unwrap());
+        let key = siglus_assets::key_toml::load_emote_key_from_project_dir(&project).unwrap();
+        // yu02's body and head both name their source `tex`
+        // (rename_colliding_sources).
+        for (prefix, body, head) in [
+            ("bup", "sn01_03制服＋エプロン", "sn01_頭部"),
+            ("ap_bup", "sn01_03制服＋エプロン", "sn01_頭部"),
+            ("bup", "yu02_02私服", "yu02_頭部"),
+            ("ap_bup", "yu02_02私服", "yu02_頭部"),
+        ] {
+            let sources = [
+                format!("{prefix}_{body}.psb"),
+                format!("{prefix}_{head}.psb"),
+                "bup_共通tl.psb".to_owned(),
+            ]
+            .map(|name| std::fs::read(project.join("dat").join(name)).unwrap());
+            let mut runtime = SiglusEmoteRuntime::from_psb_sources(
+                &sources.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                key,
+            )
+            .unwrap();
+            runtime.play_timeline("喜ぶ02", 0).unwrap();
+            runtime.skip().unwrap();
+            runtime.play_timeline("ポーズA", 1).unwrap();
+            runtime.play_timeline("待機ループ00", 2).unwrap();
+            let mut previous = std::collections::BTreeMap::<String, f32>::new();
+            // Cover several breathing cycles, including initial placement.
+            for frame in 0..600 {
+                runtime.progress_ms(16).unwrap();
+                let before_mouth = runtime.runtime.inner.evaluated_variable_values();
+                runtime.set_face_talk((frame % 10) as f32 / 10.0).unwrap();
+                let values = runtime.runtime.inner.evaluated_variable_values();
+                assert!(
+                    values
+                        .keys()
+                        .any(|name| name.starts_with("hair_") || name.starts_with("bust_")),
+                    "{prefix}_{body}: no physics outputs to check"
+                );
+                for (name, value) in values
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("hair_") || name.starts_with("bust_"))
+                {
+                    assert_eq!(
+                        *value, before_mouth[name],
+                        "{prefix} {frame} {name}: mouth changed physics"
+                    );
+                    assert!(value.is_finite());
+                    if frame == 0 {
+                        assert!(
+                            value.abs() < 1.0,
+                            "{prefix} {name}: startup impulse {value}"
+                        );
+                    }
+                    if let Some(prev) = previous.insert(name.clone(), *value) {
+                        assert!(
+                            (value - prev).abs() < 2.0,
+                            "{prefix} {frame} {name}: jumped from {prev} to {value}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

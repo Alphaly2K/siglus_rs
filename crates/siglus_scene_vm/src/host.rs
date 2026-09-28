@@ -40,7 +40,17 @@ macro_rules! switch_startup_marker {
         crate::switch_host::report_switch_marker($message)
     };
 }
-#[cfg(not(target_os = "horizon"))]
+#[cfg(target_os = "vita")]
+unsafe extern "C" {
+    fn siglus_vita_log_marker(message: *const u8);
+}
+#[cfg(target_os = "vita")]
+macro_rules! switch_startup_marker {
+    ($message:expr) => {
+        unsafe { siglus_vita_log_marker($message.as_ptr()) }
+    };
+}
+#[cfg(not(any(target_os = "horizon", target_os = "vita")))]
 macro_rules! switch_startup_marker {
     ($message:expr) => {};
 }
@@ -367,6 +377,11 @@ impl SiglusHost {
         (self.vm.ctx.screen_w.max(1), self.vm.ctx.screen_h.max(1))
     }
 
+    /// On-demand accounting for movie frames and decoded PCM retained by the VM.
+    pub fn movie_memory_stats(&self) -> crate::movie::MovieMemoryStats {
+        self.vm.ctx.movie.debug_memory_stats()
+    }
+
     pub fn debug_status_summary(&mut self) -> String {
         let blocked = self.vm.is_blocked();
         let movie_playing = self.vm.ctx.globals.mov.playing;
@@ -408,7 +423,11 @@ impl SiglusHost {
             return Ok(false);
         }
         if self.script_needs_pump || self.vm.ctx.wait.needs_runtime_poll() {
+            #[cfg(target_os = "vita")]
+            let start = Instant::now();
             self.pump_vm()?;
+            #[cfg(target_os = "vita")]
+            crate::render::vita_stats::phase(crate::render::vita_stats::PUMP, start);
         }
         self.redraw()?;
         Ok(self.pending_exit || (self.vm.is_halted() && self.flow.stack.is_empty()))
@@ -594,6 +613,16 @@ impl SiglusHost {
         &self.vm.ctx.images
     }
 
+    /// Writes the global save if what it keeps has changed since `last`
+    /// (see `global_save_fingerprint`); returns the current fingerprint.
+    pub fn persist_global_if_changed(&mut self, last: Option<u64>) -> u64 {
+        let now = crate::runtime::forms::syscom::global_save_fingerprint(&self.vm.ctx);
+        if last.is_some_and(|last| last != now) {
+            crate::runtime::forms::syscom::write_global_save(&self.vm.ctx);
+        }
+        now
+    }
+
     pub fn vm_mut(&mut self) -> &mut SceneVm<'static> {
         &mut self.vm
     }
@@ -684,12 +713,12 @@ impl SiglusHost {
             {
                 let bytes = crate::resource::read_file_bytes(&scene_pck_path)
                     .with_context(|| format!("read scene.pck: {}", scene_pck_path.display()))?;
-                ScenePck::load_and_rebuild_from_bytes(bytes, &opt)
+                ScenePck::load_lazy_from_bytes(bytes, &opt)
                     .with_context(|| format!("open scene.pck: {}", scene_pck_path.display()))?
             }
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             {
-                ScenePck::load_and_rebuild(&scene_pck_path, &opt)
+                ScenePck::load_lazy(&scene_pck_path, &opt)
                     .with_context(|| format!("open scene.pck: {}", scene_pck_path.display()))?
             }
         };
@@ -703,12 +732,12 @@ impl SiglusHost {
             pck.find_scene_no(&boot.start_scene).unwrap_or(0)
         };
 
-        let chunk = pck
-            .scn_data_slice(scene_no)
+        let (owner, range) = pck
+            .scn_data_shared(scene_no)
             .with_context(|| format!("scene_id out of range: {}", scene_no))?;
         switch_startup_marker!(b"siglus_switch: vm scene-stream begin\n\0");
-        let owner: std::sync::Arc<[u8]> = std::sync::Arc::from(chunk.to_vec().into_boxed_slice());
-        let mut stream = SceneStream::new_owned_with_string_codec(owner, pck.string_codec)?;
+        let mut stream =
+            SceneStream::new_shared_range_with_string_codec(owner, range, pck.string_codec)?;
         switch_startup_marker!(b"siglus_switch: vm scene-stream complete\n\0");
         let start_z = if config.scene_id.is_some() || config.scene_name.is_some() {
             0
@@ -727,6 +756,7 @@ impl SiglusHost {
         ctx.screen_h = initial_size.1;
         switch_startup_marker!(b"siglus_switch: vm create begin\n\0");
         let mut vm = SceneVm::with_config(VmConfig::from_env(), stream, ctx);
+        vm.install_initial_scene_pck(pck, active_append);
         switch_startup_marker!(b"siglus_switch: vm create complete\n\0");
         // C_tnm_eng::init_global() loads global/read/config save data before
         // start() calls tnm_init_local() and enters the boot scene.
@@ -735,7 +765,7 @@ impl SiglusHost {
             crate::runtime::forms::syscom::load_global_save(&mut vm.ctx)
                 .context("load global save during engine initialization")?;
             switch_startup_marker!(b"siglus_switch: vm global-save complete\n\0");
-            if std::env::var_os("SG_BOOT_TRACE").is_some() {
+            if env_is_set!("SG_BOOT_TRACE") {
                 let g1000 = vm
                     .ctx
                     .globals
@@ -766,7 +796,7 @@ impl SiglusHost {
         self.vm.ctx.script_input.use_current();
         self.syscom_suspended_waits
             .push((flow_depth, saved_wait, key.to_string()));
-        if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+        if env_is_set!("SG_PROC_FLOW_TRACE") {
             eprintln!(
                 "[SG_PROC_FLOW] host suspend_wait_for_syscom_excall key={} flow_depth={} saved_count={} scene={:?} line={}",
                 key,
@@ -799,7 +829,7 @@ impl SiglusHost {
                 crate::runtime::forms::syscom::CAPTURE_PRIOR_SAVE,
             );
         }
-        if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+        if env_is_set!("SG_PROC_FLOW_TRACE") {
             eprintln!(
                 "[SG_PROC_FLOW] host restore_wait_after_syscom_excall popped_depth={} remaining={} scene={:?} line={}",
                 popped_depth,
@@ -821,7 +851,7 @@ impl SiglusHost {
             self.vm.ctx.globals.syscom.msg_back_open = false;
         }
 
-        if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+        if env_is_set!("SG_PROC_FLOW_TRACE") {
             eprintln!(
                 "[SG_PROC_FLOW] host consume_syscom_pending kind={:?} before scene={:?} line={} flow={:?}",
                 proc.kind,
@@ -1001,7 +1031,7 @@ impl SiglusHost {
     fn ensure_requested_script_proc(&mut self) {
         let requested = self.vm.take_script_proc_request();
         if requested {
-            if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+            if env_is_set!("SG_PROC_FLOW_TRACE") {
                 eprintln!(
                     "[SG_PROC_FLOW] host ensure_requested_script_proc push before scene={:?} line={} flow={:?}",
                     self.vm.current_scene_name(),
@@ -1010,7 +1040,7 @@ impl SiglusHost {
                 );
             }
             self.flow.push(ProcType::Script, 0);
-            if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+            if env_is_set!("SG_PROC_FLOW_TRACE") {
                 eprintln!(
                     "[SG_PROC_FLOW] host ensure_requested_script_proc push after flow={:?}",
                     self.flow.stack
@@ -1289,7 +1319,7 @@ impl SiglusHost {
     }
 
     fn pump_vm(&mut self) -> Result<()> {
-        if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+        if env_is_set!("SG_PROC_FLOW_TRACE") {
             eprintln!(
                 "[SG_PROC_FLOW] host pump_vm start paused={} script_needs_pump={} scene={:?} line={} flow={:?} pending_proc={:?}",
                 self.paused,
@@ -1307,7 +1337,7 @@ impl SiglusHost {
         }
 
         self.vm.process_pending_button_actions()?;
-        if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+        if env_is_set!("SG_PROC_FLOW_TRACE") {
             eprintln!(
                 "[SG_PROC_FLOW] host pump_vm after_process_button_actions scene={:?} line={} flow={:?} pending_proc={:?}",
                 self.vm.current_scene_name(),
@@ -1328,7 +1358,7 @@ impl SiglusHost {
                 self.paused = true;
                 break;
             };
-            if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+            if env_is_set!("SG_PROC_FLOW_TRACE") {
                 eprintln!(
                     "[SG_PROC_FLOW] host pump_vm loop top proc={:?} scene={:?} line={} flow={:?}",
                     proc,
@@ -1607,7 +1637,7 @@ impl SiglusHost {
                 switch_trace_frame, scene, line, blocked,
             ));
         }
-        if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+        if env_is_set!("SG_PROC_FLOW_TRACE") {
             eprintln!(
                 "[SG_PROC_FLOW] host redraw start scene={:?} line={} flow={:?} pending_proc={:?}",
                 self.vm.current_scene_name(),
@@ -1628,7 +1658,11 @@ impl SiglusHost {
                     switch_trace_frame
                 ));
             }
+            #[cfg(target_os = "vita")]
+            let start = Instant::now();
             self.pump_vm()?;
+            #[cfg(target_os = "vita")]
+            crate::render::vita_stats::phase(crate::render::vita_stats::PUMP, start);
             #[cfg(target_os = "horizon")]
             if switch_trace_enabled {
                 crate::switch_host::report_switch_diagnostic(&format!(
@@ -1653,7 +1687,11 @@ impl SiglusHost {
                 switch_trace_frame
             ));
         }
+        #[cfg(target_os = "vita")]
+        let start = Instant::now();
         self.vm.tick_frame()?;
+        #[cfg(target_os = "vita")]
+        crate::render::vita_stats::phase(crate::render::vita_stats::TICK, start);
         #[cfg(target_os = "horizon")]
         if switch_trace_enabled {
             crate::switch_host::report_switch_diagnostic(&format!(
@@ -1665,7 +1703,7 @@ impl SiglusHost {
             self.finish_runtime_load();
             return Ok(());
         }
-        if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+        if env_is_set!("SG_PROC_FLOW_TRACE") {
             eprintln!(
                 "[SG_PROC_FLOW] host redraw after_tick scene={:?} line={} flow={:?} pending_proc={:?}",
                 self.vm.current_scene_name(),
@@ -1685,7 +1723,7 @@ impl SiglusHost {
         self.ensure_requested_script_proc();
         let render_suppressed = self.suppress_render_once;
         self.suppress_render_once = false;
-        if std::env::var_os("SG_PROC_FLOW_TRACE").is_some() {
+        if env_is_set!("SG_PROC_FLOW_TRACE") {
             eprintln!(
                 "[SG_PROC_FLOW] host redraw render_decision render_suppressed={} scene={:?} line={} flow={:?}",
                 render_suppressed,
@@ -1702,7 +1740,11 @@ impl SiglusHost {
                     switch_trace_frame
                 ));
             }
+            #[cfg(target_os = "vita")]
+            let start = Instant::now();
             let frame = self.vm.ctx.render_frame_with_effects();
+            #[cfg(target_os = "vita")]
+            crate::render::vita_stats::phase(crate::render::vita_stats::BUILD, start);
             #[cfg(target_os = "horizon")]
             if switch_trace_enabled {
                 let (wipe_type, wipe_progress, emote_count) = if let Some(wipe) = &frame.wipe {
