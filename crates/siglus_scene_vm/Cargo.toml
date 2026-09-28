@@ -12,6 +12,7 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 # (`platform_time::advance_virtual_clock`), for deterministic replays of the
 # VM (examples/vm_replay.rs). Never enable it in a player.
 virtual-clock = []
+art3m1s-host-audio = []
 
 [dependencies]
 rustc-hash = "2"

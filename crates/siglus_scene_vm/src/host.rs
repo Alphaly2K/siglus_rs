@@ -197,7 +197,8 @@ pub struct SiglusHost {
     config: SiglusHostConfig,
     boot: BootConfig,
     flow: ProcFlow,
-    renderer: Rc<RefCell<Renderer>>,
+    renderer: Option<Rc<RefCell<Renderer>>>,
+    external_frame: Option<crate::layer::RenderFrame>,
     vm: SceneVm<'static>,
     redraw_count: u32,
     script_needs_pump: bool,
@@ -255,6 +256,19 @@ impl SiglusHost {
     /// Synchronous constructor for native hosts which own their event loop and
     /// do not use a desktop async executor (Horizon/libnx in particular).
     pub fn new_with_renderer_sync(config: SiglusHostConfig, renderer: Renderer) -> Result<Self> {
+        Self::new_with_optional_renderer(config, Some(renderer))
+    }
+
+    /// Drive the VM from an embedding host which owns GPU submission.
+    /// The host consumes each `RenderFrame` and the corresponding image data.
+    pub fn new_external(config: SiglusHostConfig) -> Result<Self> {
+        Self::new_with_optional_renderer(config, None)
+    }
+
+    fn new_with_optional_renderer(
+        config: SiglusHostConfig,
+        renderer: Option<Renderer>,
+    ) -> Result<Self> {
         switch_startup_marker!(b"siglus_switch: host initial-size begin\n\0");
         let initial_size = Self::resolve_initial_size(&config);
         switch_startup_marker!(b"siglus_switch: host initial-size complete\n\0");
@@ -264,19 +278,25 @@ impl SiglusHost {
         let mut flow = ProcFlow::default();
         flow.push(ProcType::Script, 0);
         flow.push(ProcType::StartWarning, 0);
-        let chihaya_display_adapter_name = renderer.adapter_name();
-        let renderer = Rc::new(RefCell::new(renderer));
+        let chihaya_display_adapter_name = renderer
+            .as_ref()
+            .map(Renderer::adapter_name)
+            .unwrap_or_else(|| "Art3m1s".to_string());
+        let renderer = renderer.map(|renderer| Rc::new(RefCell::new(renderer)));
         switch_startup_marker!(b"siglus_switch: host vm-init begin\n\0");
         let mut vm = Self::init_vm(&config, &boot, initial_size)?;
         switch_startup_marker!(b"siglus_switch: host vm-init complete\n\0");
         vm.ctx.globals.system.chihaya_display_adapter_name = chihaya_display_adapter_name;
-        let capture_backend: FrameCaptureBackendRef = renderer.clone();
-        vm.ctx.set_frame_capture_backend(Some(capture_backend));
+        if let Some(renderer) = renderer.as_ref() {
+            let capture_backend: FrameCaptureBackendRef = renderer.clone();
+            vm.ctx.set_frame_capture_backend(Some(capture_backend));
+        }
         Ok(Self {
             config,
             boot,
             flow,
             renderer,
+            external_frame: None,
             vm,
             redraw_count: 0,
             script_needs_pump: true,
@@ -311,9 +331,11 @@ impl SiglusHost {
     }
 
     pub fn resize(&mut self, width: u32, height: u32, scale_factor: f32) {
-        self.renderer
-            .borrow_mut()
-            .resize_with_scale(width, height, scale_factor.max(1.0));
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer
+                .borrow_mut()
+                .resize_with_scale(width, height, scale_factor.max(1.0));
+        }
         let logical_w = ((width as f32) / scale_factor.max(1.0)).max(1.0).round() as u32;
         let logical_h = ((height as f32) / scale_factor.max(1.0)).max(1.0).round() as u32;
         self.vm.ctx.set_screen_size(logical_w, logical_h);
@@ -332,17 +354,19 @@ impl SiglusHost {
         viewport_width: u32,
         viewport_height: u32,
     ) {
-        self.renderer.borrow_mut().resize_with_logical_viewport(
-            surface_width,
-            surface_height,
-            scale_factor.max(1.0),
-            logical_width.max(1),
-            logical_height.max(1),
-            viewport_x,
-            viewport_y,
-            viewport_width.max(1),
-            viewport_height.max(1),
-        );
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer.borrow_mut().resize_with_logical_viewport(
+                surface_width,
+                surface_height,
+                scale_factor.max(1.0),
+                logical_width.max(1),
+                logical_height.max(1),
+                viewport_x,
+                viewport_y,
+                viewport_width.max(1),
+                viewport_height.max(1),
+            );
+        }
         self.vm
             .ctx
             .set_screen_size(logical_width.max(1), logical_height.max(1));
@@ -407,6 +431,12 @@ impl SiglusHost {
         }
         self.redraw()?;
         Ok(self.pending_exit || (self.vm.is_halted() && self.flow.stack.is_empty()))
+    }
+
+    /// Produce interleaved 48 kHz stereo PCM for an external host device.
+    #[cfg(feature = "art3m1s-host-audio")]
+    pub fn render_host_audio(&mut self, output: &mut [f32]) {
+        self.vm.ctx.audio.render_host_pcm(output);
     }
 
     pub fn mouse_move(&mut self, x: f64, y: f64) {
@@ -569,7 +599,18 @@ impl SiglusHost {
     }
 
     pub fn renderer_mut(&mut self) -> RefMut<'_, Renderer> {
-        self.renderer.borrow_mut()
+        self.renderer
+            .as_ref()
+            .expect("external Siglus host has no wgpu renderer")
+            .borrow_mut()
+    }
+
+    pub fn take_external_frame(&mut self) -> Option<crate::layer::RenderFrame> {
+        self.external_frame.take()
+    }
+
+    pub fn external_images(&self) -> &crate::image_manager::ImageManager {
+        &self.vm.ctx.images
     }
 
     /// Writes the global save if what it keeps has changed since `last`
@@ -1204,7 +1245,9 @@ impl SiglusHost {
     }
 
     fn finish_runtime_load(&mut self) {
-        self.renderer.borrow_mut().clear_runtime_image_textures();
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer.borrow_mut().clear_runtime_image_textures();
+        }
         self.flow.stack.clear();
         self.flow.pending_syscom_proc = None;
         self.syscom_suspended_waits.clear();
@@ -1234,7 +1277,9 @@ impl SiglusHost {
         // changes, so resetting the append before restart preserves that ordering.
         self.vm.ctx.reset_active_append_to_initial();
         self.vm.restart_scene_name(&target_scene, target_z)?;
-        self.renderer.borrow_mut().clear_runtime_image_textures();
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer.borrow_mut().clear_runtime_image_textures();
+        }
         if let Some(msgbk) = saved_msgbk {
             self.vm.ctx.globals.msgbk_forms = msgbk;
         }
@@ -1262,7 +1307,9 @@ impl SiglusHost {
         // scene without resetting the active append.
         crate::runtime::forms::syscom::write_global_save(&self.vm.ctx);
         self.vm.restart_scene_name(&target_scene, target_z)?;
-        self.renderer.borrow_mut().clear_runtime_image_textures();
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer.borrow_mut().clear_runtime_image_textures();
+        }
         self.vm.ctx.globals.finish_wipe();
         self.flow.stack.clear();
         self.flow.pending_syscom_proc = None;
@@ -1627,9 +1674,11 @@ impl SiglusHost {
         // eng_frame.cpp applies SCRIPT.SET_VSYNC_WAIT_OFF_FLAG after script
         // processing and before the frame is presented. Keep the VM flag as the
         // script state and let Renderer perform the display-side transition.
-        self.renderer
-            .borrow_mut()
-            .set_wait_display_vsync(!self.vm.ctx.globals.script.wait_display_vsync_off_flag);
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer
+                .borrow_mut()
+                .set_wait_display_vsync(!self.vm.ctx.globals.script.wait_display_vsync_off_flag);
+        }
         let wait_poll_needed = self.vm.ctx.wait.needs_runtime_poll();
         #[cfg(target_os = "horizon")]
         if switch_trace_enabled {
@@ -1733,9 +1782,13 @@ impl SiglusHost {
                     switch_trace_frame
                 ));
             }
-            self.renderer
-                .borrow_mut()
-                .render_frame(&self.vm.ctx.images, &frame)?;
+            if let Some(renderer) = self.renderer.as_ref() {
+                renderer
+                    .borrow_mut()
+                    .render_frame(&self.vm.ctx.images, &frame)?;
+            } else {
+                self.external_frame = Some(frame);
+            }
             #[cfg(target_os = "horizon")]
             if switch_trace_enabled {
                 crate::switch_host::report_switch_diagnostic(&format!(

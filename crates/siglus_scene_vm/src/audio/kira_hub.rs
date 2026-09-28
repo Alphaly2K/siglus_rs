@@ -1,11 +1,19 @@
 use std::fmt;
 
-#[cfg(any(target_os = "horizon", target_os = "vita"))]
+#[cfg(all(
+    any(target_os = "horizon", target_os = "vita"),
+    not(feature = "art3m1s-host-audio")
+))]
 use super::switch_backend::SwitchBackend as PlatformBackend;
 use anyhow::{Context, Result, anyhow};
 use kira::Volume;
-#[cfg(not(any(target_os = "horizon", target_os = "vita")))]
+#[cfg(all(
+    not(any(target_os = "horizon", target_os = "vita")),
+    not(feature = "art3m1s-host-audio")
+))]
 use kira::manager::backend::DefaultBackend as PlatformBackend;
+#[cfg(feature = "art3m1s-host-audio")]
+use kira::manager::backend::mock::{MockBackend as PlatformBackend, MockBackendSettings};
 use kira::manager::{AudioManager, AudioManagerSettings};
 use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle};
 #[cfg(not(target_arch = "wasm32"))]
@@ -66,8 +74,16 @@ impl AudioHub {
         let manager = if cfg!(feature = "virtual-clock") {
             Err(anyhow!("virtual clock: audio off"))
         } else {
-            AudioManager::<PlatformBackend>::new(AudioManagerSettings::default())
-                .map_err(|e| anyhow!("{e}"))
+            #[cfg(feature = "art3m1s-host-audio")]
+            let settings = AudioManagerSettings {
+                backend_settings: MockBackendSettings {
+                    sample_rate: 48_000,
+                },
+                ..AudioManagerSettings::default()
+            };
+            #[cfg(not(feature = "art3m1s-host-audio"))]
+            let settings = AudioManagerSettings::default();
+            AudioManager::<PlatformBackend>::new(settings).map_err(|e| anyhow!("{e:?}"))
         };
         match manager {
             Ok(mut manager) => {
@@ -96,7 +112,7 @@ impl AudioHub {
                 }
             }
             Err(e) => {
-                eprintln!("kira init failed, audio disabled: {:#}", e);
+                eprintln!("kira init failed, audio disabled: {e:?}");
                 Self {
                     manager: None,
                     bgm: None,
@@ -121,6 +137,23 @@ impl AudioHub {
 
     pub fn is_enabled(&self) -> bool {
         self.manager.is_some()
+    }
+
+    /// Host-owned device path: Kira still decodes and mixes, but never opens
+    /// the platform audio device. The caller supplies the output clock.
+    #[cfg(feature = "art3m1s-host-audio")]
+    pub fn render_host_pcm(&mut self, output: &mut [f32]) {
+        let Some(manager) = self.manager.as_mut() else {
+            output.fill(0.0);
+            return;
+        };
+        let backend = manager.backend_mut();
+        backend.on_start_processing();
+        for pair in output.chunks_exact_mut(2) {
+            let frame = backend.process();
+            pair[0] = frame.left;
+            pair[1] = frame.right;
+        }
     }
 
     fn track_ref(&self, kind: TrackKind) -> Option<&TrackHandle> {
@@ -264,5 +297,31 @@ impl AudioHub {
     pub fn set_track_volume_raw_fade(&mut self, kind: TrackKind, volume_raw: u8, fade_ms: i64) {
         *self.track_base_mut(kind) = volume_raw;
         self.apply_track_volume_fade(kind, fade_ms);
+    }
+}
+
+#[cfg(all(test, feature = "art3m1s-host-audio"))]
+mod host_audio_tests {
+    use std::sync::Arc;
+
+    use kira::Frame;
+    use kira::sound::static_sound::{StaticSoundData, StaticSoundSettings};
+
+    use super::{AudioHub, TrackKind};
+
+    #[test]
+    fn device_free_backend_renders_pcm() {
+        let mut hub = AudioHub::new();
+        assert!(hub.is_enabled());
+        let sound = StaticSoundData {
+            sample_rate: 48_000,
+            frames: Arc::from(vec![Frame::from_mono(0.5); 4_800]),
+            settings: StaticSoundSettings::default(),
+            slice: None,
+        };
+        let _handle = hub.play_static(TrackKind::Se, sound).unwrap();
+        let mut pcm = vec![0.0; 1_024 * 2];
+        hub.render_host_pcm(&mut pcm);
+        assert!(pcm.iter().any(|sample| sample.abs() > 0.01));
     }
 }
