@@ -7,6 +7,9 @@ license.workspace = true
 [lib]
 crate-type = ["rlib", "cdylib", "staticlib"]
 
+[features]
+art3m1s-host-audio = []
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
