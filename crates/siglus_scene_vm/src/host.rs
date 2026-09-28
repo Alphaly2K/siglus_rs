@@ -414,6 +414,12 @@ impl SiglusHost {
         Ok(self.pending_exit || (self.vm.is_halted() && self.flow.stack.is_empty()))
     }
 
+    /// Produce interleaved 48 kHz stereo PCM for an external host device.
+    #[cfg(feature = "art3m1s-host-audio")]
+    pub fn render_host_audio(&mut self, output: &mut [f32]) {
+        self.vm.ctx.audio.render_host_pcm(output);
+    }
+
     pub fn mouse_move(&mut self, x: f64, y: f64) {
         if self.native_messagebox_pending() {
             return;
