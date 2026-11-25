@@ -13,6 +13,7 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 # VM (examples/vm_replay.rs). Never enable it in a player.
 virtual-clock = []
 art3m1s-host-audio = []
+art3m1s-host-clock = []
 
 [dependencies]
 rustc-hash = "2"

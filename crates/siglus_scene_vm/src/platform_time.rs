@@ -6,33 +6,77 @@
 
 pub use std::time::Duration;
 
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[cfg(all(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    not(any(feature = "virtual-clock", feature = "art3m1s-host-clock"))
+))]
 pub use web_time::Instant;
 
 #[cfg(all(
     not(all(target_arch = "wasm32", target_os = "unknown")),
-    not(feature = "virtual-clock")
+    not(any(feature = "virtual-clock", feature = "art3m1s-host-clock"))
 ))]
 pub use std::time::Instant;
 
+#[cfg(any(feature = "virtual-clock", feature = "art3m1s-host-clock"))]
+pub use controlled_clock::Instant;
 #[cfg(feature = "virtual-clock")]
-pub use virtual_clock::{Instant, advance_virtual_clock};
+pub use controlled_clock::advance_virtual_clock;
+#[cfg(feature = "art3m1s-host-clock")]
+pub use controlled_clock::with_host_time;
 
-/// A monotonic clock that only moves when told to, with the parts of
-/// `std::time::Instant`'s API the engine uses: VM replays then run the same
-/// on every machine and at any speed.
-#[cfg(feature = "virtual-clock")]
-mod virtual_clock {
+#[cfg(any(feature = "virtual-clock", feature = "art3m1s-host-clock"))]
+mod controlled_clock {
     use std::ops::{Add, AddAssign, Sub, SubAssign};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    /// Nanoseconds since the virtual epoch; starts at one day so that
-    /// subtracting small durations from `now()` stays valid.
-    static NOW_NS: AtomicU64 = AtomicU64::new(86_400_000_000_000);
+    // Keep small subtractions from now() valid at the beginning of a session.
+    const EPOCH_NS: u64 = 86_400_000_000_000;
 
+    #[cfg(feature = "virtual-clock")]
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(feature = "virtual-clock")]
+    static NOW_NS: AtomicU64 = AtomicU64::new(EPOCH_NS);
+
+    #[cfg(feature = "virtual-clock")]
     pub fn advance_virtual_clock(by: Duration) {
         NOW_NS.fetch_add(by.as_nanos() as u64, Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "art3m1s-host-clock")]
+    thread_local! {
+        static HOST_NS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Run VM callbacks with the monotonic time elapsed in one Host session.
+    #[cfg(feature = "art3m1s-host-clock")]
+    pub fn with_host_time<T>(elapsed: Duration, run: impl FnOnce() -> T) -> T {
+        struct Restore(Option<u64>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                HOST_NS.set(self.0);
+            }
+        }
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let _restore = Restore(HOST_NS.replace(Some(EPOCH_NS.saturating_add(nanos))));
+        run()
+    }
+
+    #[cfg(feature = "virtual-clock")]
+    fn default_now() -> u64 {
+        NOW_NS.load(Ordering::SeqCst)
+    }
+
+    #[cfg(not(feature = "virtual-clock"))]
+    fn default_now() -> u64 {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        use std::time::Instant as SystemInstant;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        use web_time::Instant as SystemInstant;
+
+        static START: std::sync::OnceLock<SystemInstant> = std::sync::OnceLock::new();
+        let nanos = START.get_or_init(SystemInstant::now).elapsed().as_nanos();
+        EPOCH_NS.saturating_add(u64::try_from(nanos).unwrap_or(u64::MAX))
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -40,7 +84,11 @@ mod virtual_clock {
 
     impl Instant {
         pub fn now() -> Self {
-            Self(NOW_NS.load(Ordering::SeqCst))
+            #[cfg(feature = "art3m1s-host-clock")]
+            if let Some(nanos) = HOST_NS.get() {
+                return Self(nanos);
+            }
+            Self(default_now())
         }
 
         pub fn elapsed(&self) -> Duration {
