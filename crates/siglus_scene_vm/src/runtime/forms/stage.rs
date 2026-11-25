@@ -291,6 +291,22 @@ enum StageTarget {
 fn load_thumb_image_id(ctx: &mut CommandContext, idx: i64) -> Option<ImageHandle> {
     let dir = ctx.project_dir.join("savedata");
     for path in super::syscom::thumb_candidate_paths(&dir, idx) {
+        if ctx.save_files().is_host() {
+            if let Ok(Some(bytes)) = ctx.save_files().read_path(&path)
+                && let Ok(image) = image::load_from_memory(&bytes)
+            {
+                let image = image.into_rgba8();
+                let (width, height) = image.dimensions();
+                return Some(ctx.images.insert_image(crate::assets::RgbaImage {
+                    width,
+                    height,
+                    center_x: 0,
+                    center_y: 0,
+                    rgba: image.into_raw(),
+                }));
+            }
+            continue;
+        }
         if let Some(path) = crate::resource::resolve_game_file(&path).ok().flatten()
             && let Ok(img_id) = ctx.images.load_file(&path, 0)
         {

@@ -395,6 +395,7 @@ pub struct CommandContext {
     /// Reused element/chain buffers (see `IntVecPool`).
     pub int_vec_pool: IntVecPool,
     pub project_dir: PathBuf,
+    pub(crate) save_store: Option<Arc<dyn crate::original_save::SiglusSaveStore>>,
 
     /// Project-wide variable DWORD used by encrypted Emote PSB files. Native
     /// hosts preload/recover this before scene execution; direct VM users still
@@ -1540,6 +1541,7 @@ impl CommandContext {
             se: SeEngine::new(project_dir.clone()),
             movie: MovieManager::new(project_dir.clone()),
             project_dir,
+            save_store: None,
             emote_key,
             solid_white,
             tables,
@@ -2152,6 +2154,10 @@ impl CommandContext {
             Arc::new(SceneMetadata::from_pack(pck)?),
         ));
         Ok(())
+    }
+
+    pub(crate) fn save_files(&self) -> crate::original_save::SaveFiles<'_> {
+        crate::original_save::SaveFiles::new(&self.project_dir, self.save_store.as_deref())
     }
 
     pub(crate) fn load_scene_pack(&self, append: &str) -> Result<ScenePck> {

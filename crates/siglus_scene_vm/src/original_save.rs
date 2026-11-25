@@ -6,6 +6,154 @@ use std::path::{Path, PathBuf};
 
 use crate::runtime::globals::SaveSlotState;
 
+/// Persistence for one game's saves. Keys are file names in its save namespace.
+pub trait SiglusSaveStore: Send + Sync {
+    fn read(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    fn write(&self, key: &str, bytes: &[u8]) -> Result<()>;
+    fn remove(&self, key: &str) -> Result<()>;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SaveFiles<'a> {
+    project: &'a Path,
+    store: Option<&'a dyn SiglusSaveStore>,
+}
+
+impl<'a> SaveFiles<'a> {
+    pub(crate) fn new(project: &'a Path, store: Option<&'a dyn SiglusSaveStore>) -> Self {
+        Self { project, store }
+    }
+
+    pub(crate) fn read(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(store) = self.store {
+            return store.read(key);
+        }
+        let path = save_dir(self.project).join(key);
+        let Some(path) = crate::resource::resolve_windows_case_insensitive_file(&path)? else {
+            return Ok(None);
+        };
+        crate::resource::read_file_bytes(&path).map(Some)
+    }
+
+    pub(crate) fn write(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        if let Some(store) = self.store {
+            return store.write(key, bytes);
+        }
+        write_save_bytes(&save_dir(self.project).join(key), bytes)
+    }
+    pub(crate) fn project_dir(&self) -> &'a Path {
+        self.project
+    }
+
+    pub(crate) fn is_host(&self) -> bool {
+        self.store.is_some()
+    }
+
+    fn key(path: &Path) -> Result<&str> {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("invalid save file name"))
+    }
+
+    pub(crate) fn read_path(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+        self.read(Self::key(path)?)
+    }
+
+    pub(crate) fn write_path(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        self.write(Self::key(path)?, bytes)
+    }
+
+    pub(crate) fn read_local(
+        &self,
+        path: &Path,
+    ) -> Result<(OriginalSaveHeader, OriginalLocalSaveEnvelope)> {
+        if self.is_host() {
+            let data = self.read_path(path)?.context("local save missing")?;
+            decode_local_save(&data)
+        } else {
+            read_local_save_file(path)
+        }
+    }
+
+    pub(crate) fn write_local(
+        &self,
+        path: &Path,
+        slot: &SaveSlotState,
+        env: &OriginalLocalSaveEnvelope,
+    ) -> Result<()> {
+        self.write_path(path, &encode_local_save(slot, env))
+    }
+
+    pub(crate) fn read_slot(&self, path: &Path) -> Option<SaveSlotState> {
+        if !self.is_host() {
+            return read_slot_from_path(path);
+        }
+        let data = self.read_path(path).ok()??;
+        OriginalSaveHeader::from_file_prefix(&data, data.len())
+            .ok()
+            .map(|header| header.to_slot())
+    }
+
+    pub(crate) fn update_header(&self, path: &Path, header: &OriginalSaveHeader) -> Result<()> {
+        if !self.is_host() {
+            let path = crate::resource::resolve_game_file(path)?.context("local save missing")?;
+            return write_header_in_place(&path, header);
+        }
+        let mut bytes = self.read_path(path)?.context("local save missing")?;
+        let existing = OriginalSaveHeader::from_file_prefix(&bytes, bytes.len())?;
+        let mut header = header.clone();
+        header.layout = existing.layout;
+        header.data_size = existing.data_size;
+        bytes[..header.header_size()].copy_from_slice(&header.to_bytes());
+        self.write_path(path, &bytes)
+    }
+
+    pub(crate) fn remove_path(&self, path: &Path) -> Result<()> {
+        if let Some(store) = self.store {
+            return store.remove(Self::key(path)?);
+        }
+        if let Some(path) = crate::resource::resolve_game_file(path)? {
+            fs::remove_file(&path)?;
+            crate::resource::invalidate_game_path_cache(&path);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn copy_path(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.replace_path(dst, self.read_path(src)?.as_deref())
+    }
+
+    pub(crate) fn swap_paths(&self, a: &Path, b: &Path) -> Result<()> {
+        let first = self.read_path(a)?;
+        let second = self.read_path(b)?;
+        self.replace_path(a, second.as_deref())?;
+        if let Err(err) = self.replace_path(b, first.as_deref()) {
+            if let Err(rollback) = self.replace_path(a, first.as_deref()) {
+                log::error!("could not restore the first save after failed swap: {rollback:#}");
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn replace_path(&self, path: &Path, bytes: Option<&[u8]>) -> Result<()> {
+        match bytes {
+            Some(bytes) => self.write_path(path, bytes),
+            None => self.remove_path(path),
+        }
+    }
+}
+
+fn write_save_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create save dir {}", parent.display()))?;
+    }
+    fs::write(path, bytes).with_context(|| format!("write save file {}", path.display()))?;
+    crate::resource::invalidate_game_path_cache(path);
+    Ok(())
+}
+
 pub const SAVE_APPEND_DIR_MAX_LEN: usize = 256;
 pub const SAVE_APPEND_NAME_MAX_LEN: usize = 256;
 pub const SAVE_TITLE_MAX_LEN: usize = 256;
@@ -1121,18 +1269,15 @@ pub fn write_local_save_file(
     slot: &SaveSlotState,
     env: &OriginalLocalSaveEnvelope,
 ) -> Result<()> {
-    let payload = env.to_bytes();
-    let packed = pack_buffer(&payload);
+    write_save_bytes(path, &encode_local_save(slot, env))
+}
+
+fn encode_local_save(slot: &SaveSlotState, env: &OriginalLocalSaveEnvelope) -> Vec<u8> {
+    let packed = pack_buffer(&env.to_bytes());
     let header = OriginalSaveHeader::from_slot(slot, packed.len());
     let mut out = header.to_bytes();
     out.extend_from_slice(&packed);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create save dir {}", parent.display()))?;
-    }
-    fs::write(path, out).with_context(|| format!("write save file {}", path.display()))?;
-    crate::resource::invalidate_game_path_cache(path);
-    Ok(())
+    out
 }
 
 pub fn write_slot_file(path: &Path, slot: &SaveSlotState) -> Result<()> {
@@ -1145,19 +1290,23 @@ pub fn read_local_save_file(
 ) -> Result<(OriginalSaveHeader, OriginalLocalSaveEnvelope)> {
     let data = crate::resource::read_file_bytes(path)
         .with_context(|| format!("read save file {}", path.display()))?;
+    decode_local_save(&data).with_context(|| format!("decode local save {}", path.display()))
+}
+
+fn decode_local_save(data: &[u8]) -> Result<(OriginalSaveHeader, OriginalLocalSaveEnvelope)> {
     if data.len() < LEGACY_SAVE_HEADER_SIZE {
-        bail!("save file too short: {}", path.display());
+        bail!("save file too short: {} bytes", data.len());
     }
-    let header = OriginalSaveHeader::from_file_prefix(&data, data.len())?;
+    let header = OriginalSaveHeader::from_file_prefix(data, data.len())?;
     let env = match header.layout {
         LocalSaveLayout::LegacySplit { local_ex_data_size } => {
-            read_split_local_save(&data, &header, local_ex_data_size)
+            read_split_local_save(data, &header, local_ex_data_size)
         }
         LocalSaveLayout::CurrentEnvelope | LocalSaveLayout::LegacyEnvelope => {
-            read_enveloped_local_save(&data, &header)
+            read_enveloped_local_save(data, &header)
         }
     }
-    .with_context(|| format!("decode local save {} ({:?})", path.display(), header.layout))?;
+    .with_context(|| format!("decode local save layout {:?}", header.layout))?;
     Ok((header, env))
 }
 
@@ -1205,30 +1354,31 @@ fn read_split_local_save(
 }
 
 pub fn write_global_save_file(project_dir: &Path, global_stream: &[u8]) -> Result<()> {
+    SaveFiles::new(project_dir, None).write("global.sav", &encode_global_save(global_stream))
+}
+
+pub(crate) fn encode_global_save(global_stream: &[u8]) -> Vec<u8> {
     let packed = pack_buffer(global_stream);
     let header = OriginalGlobalSaveHeader {
         major_version: 2,
         minor_version: 0,
         global_data_size: packed.len() as i32,
     };
-    let path = save_dir(project_dir).join("global.sav");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create save dir {}", parent.display()))?;
-    }
     let mut out = header.to_bytes();
     out.extend_from_slice(&packed);
-    fs::write(&path, out).with_context(|| format!("write global save file {}", path.display()))?;
-    crate::resource::invalidate_game_path_cache(&path);
-    Ok(())
+    out
 }
 
 pub fn read_global_save_file(project_dir: &Path) -> Result<(OriginalGlobalSaveHeader, Vec<u8>)> {
     let path = save_dir(project_dir).join("global.sav");
     let data = crate::resource::read_file_bytes(&path)
         .with_context(|| format!("read global save file {}", path.display()))?;
+    decode_global_save(&data)
+}
+
+pub(crate) fn decode_global_save(data: &[u8]) -> Result<(OriginalGlobalSaveHeader, Vec<u8>)> {
     if data.len() < GLOBAL_SAVE_HEADER_SIZE {
-        bail!("global save file too short: {}", path.display());
+        bail!("global save file too short: {} bytes", data.len());
     }
     let header = OriginalGlobalSaveHeader::from_bytes(&data[..GLOBAL_SAVE_HEADER_SIZE])?;
     let size = header.global_data_size.max(0) as usize;
@@ -1252,6 +1402,10 @@ pub fn read_global_save_file(project_dir: &Path) -> Result<(OriginalGlobalSaveHe
 /// and one byte per read flag.  Keeping the scene name is important because
 /// scene indices can move when scripts are rebuilt.
 pub fn write_read_save_file(project_dir: &Path, scene_rows: &[(String, Vec<u8>)]) -> Result<()> {
+    SaveFiles::new(project_dir, None).write("read.sav", &encode_read_save(scene_rows))
+}
+
+pub(crate) fn encode_read_save(scene_rows: &[(String, Vec<u8>)]) -> Vec<u8> {
     let mut stream = OriginalStreamWriter::new();
     for (scene_name, flags) in scene_rows {
         stream.push_str(scene_name);
@@ -1259,20 +1413,13 @@ pub fn write_read_save_file(project_dir: &Path, scene_rows: &[(String, Vec<u8>)]
         stream.push_raw(flags);
     }
     let packed = pack_buffer(&stream.into_inner());
-    let path = save_dir(project_dir).join("read.sav");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create save dir {}", parent.display()))?;
-    }
     let mut out = Vec::with_capacity(16 + packed.len());
     push_i32(&mut out, 1);
     push_i32(&mut out, 0);
     push_i32(&mut out, packed.len().min(i32::MAX as usize) as i32);
     push_i32(&mut out, scene_rows.len().min(i32::MAX as usize) as i32);
     out.extend_from_slice(&packed);
-    fs::write(&path, out).with_context(|| format!("write read save file {}", path.display()))?;
-    crate::resource::invalidate_game_path_cache(&path);
-    Ok(())
+    out
 }
 
 /// Read `savedata/read.sav` without assigning rows to current scene indices.
@@ -1281,6 +1428,10 @@ pub fn read_read_save_file(project_dir: &Path) -> Result<Vec<(String, Vec<u8>)>>
     let path = save_dir(project_dir).join("read.sav");
     let data = crate::resource::read_file_bytes(&path)
         .with_context(|| format!("read read save file {}", path.display()))?;
+    decode_read_save(&data)
+}
+
+pub(crate) fn decode_read_save(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     if data.len() < 16 {
         bail!("read save header too short: {}", data.len());
     }
@@ -1329,30 +1480,31 @@ pub fn read_read_save_file(project_dir: &Path) -> Result<Vec<(String, Vec<u8>)>>
 }
 
 pub fn write_config_save_file(project_dir: &Path, config_stream: &[u8]) -> Result<()> {
+    SaveFiles::new(project_dir, None).write("config.sav", &encode_config_save(config_stream))
+}
+
+pub(crate) fn encode_config_save(config_stream: &[u8]) -> Vec<u8> {
     let packed = pack_buffer(config_stream);
     let header = OriginalConfigSaveHeader {
         major_version: 1,
         minor_version: 4,
         config_data_size: packed.len() as i32,
     };
-    let path = save_dir(project_dir).join("config.sav");
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create save dir {}", parent.display()))?;
-    }
     let mut out = header.to_bytes();
     out.extend_from_slice(&packed);
-    fs::write(&path, out).with_context(|| format!("write config save file {}", path.display()))?;
-    crate::resource::invalidate_game_path_cache(&path);
-    Ok(())
+    out
 }
 
 pub fn read_config_save_file(project_dir: &Path) -> Result<(OriginalConfigSaveHeader, Vec<u8>)> {
     let path = save_dir(project_dir).join("config.sav");
     let data = crate::resource::read_file_bytes(&path)
         .with_context(|| format!("read config save file {}", path.display()))?;
+    decode_config_save(&data)
+}
+
+pub(crate) fn decode_config_save(data: &[u8]) -> Result<(OriginalConfigSaveHeader, Vec<u8>)> {
     if data.len() < CONFIG_SAVE_HEADER_SIZE {
-        bail!("config save file too short: {}", path.display());
+        bail!("config save file too short: {} bytes", data.len());
     }
     let header = OriginalConfigSaveHeader::from_bytes(&data[..CONFIG_SAVE_HEADER_SIZE])?;
     if header.major_version != 1 || header.minor_version < 0 {

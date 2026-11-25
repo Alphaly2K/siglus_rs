@@ -12453,7 +12453,7 @@ impl<'a> SceneVm<'a> {
             local_ex_stream: snapshot.local_ex_stream.clone(),
             sel_saves: snapshot.sel_saves.clone(),
         };
-        if let Err(err) = crate::original_save::write_local_save_file(&path, &slot, &env) {
+        if let Err(err) = self.ctx.save_files().write_local(&path, &slot, &env) {
             if req.kind == RuntimeSaveKind::Normal {
                 crate::runtime::forms::syscom::free_runtime_save_thumb_capture(
                     &mut self.ctx,
@@ -12566,7 +12566,7 @@ impl<'a> SceneVm<'a> {
                     crate::resource::game_file_exists(&path)
                 );
             }
-            let (_header, env) = crate::original_save::read_local_save_file(&path)?;
+            let (_header, env) = self.ctx.save_files().read_local(&path)?;
             let meta = LoadedEnvelopeMeta {
                 save_id: env.save_id,
                 append_dir: env.append_dir.clone(),

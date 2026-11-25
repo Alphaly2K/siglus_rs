@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use siglus_assets::gameexe::{GameexeConfig, GameexeDecodeOptions, decode_gameexe_dat_bytes};
 use siglus_assets::scene_pck::{ScenePck, ScenePckDecodeOptions};
 
+pub use crate::original_save::SiglusSaveStore;
 use crate::render::Renderer;
 use crate::resource::SelectIniAppendEntry;
 use crate::runtime::forms::syscom as syscom_form;
@@ -58,13 +59,27 @@ macro_rules! switch_startup_marker {
     ($message:expr) => {};
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SiglusHostConfig {
     pub project_dir: PathBuf,
     pub scene_name: Option<String>,
     pub scene_id: Option<usize>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub save_store: Option<Arc<dyn SiglusSaveStore>>,
+}
+
+impl std::fmt::Debug for SiglusHostConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiglusHostConfig")
+            .field("project_dir", &self.project_dir)
+            .field("scene_name", &self.scene_name)
+            .field("scene_id", &self.scene_id)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("has_save_store", &self.save_store.is_some())
+            .finish()
+    }
 }
 
 impl SiglusHostConfig {
@@ -75,6 +90,7 @@ impl SiglusHostConfig {
             scene_id: None,
             width: None,
             height: None,
+            save_store: None,
         }
     }
 }
@@ -757,6 +773,7 @@ impl SiglusHost {
             source,
         );
         switch_startup_marker!(b"siglus_switch: vm command-context complete\n\0");
+        ctx.save_store = config.save_store.clone();
         let active_append = ctx.globals.append_dir.clone();
         switch_startup_marker!(b"siglus_switch: vm scene-metadata begin\n\0");
         ctx.install_scene_metadata(&active_append, &pck)?;

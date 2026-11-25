@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::assets::RgbaImage;
-use crate::original_save::{self, SaveKind};
+use crate::original_save::{self, SaveFiles, SaveKind};
 
 use super::prop_access;
 
@@ -744,7 +744,7 @@ pub fn menu_load_slot(ctx: &mut CommandContext, quick: bool, idx: usize) {
     let quick_cnt = configured_save_count(ctx, true);
     if quick {
         ensure_slot_loaded_with_counts(
-            &ctx.project_dir,
+            SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
             true,
             save_cnt,
             quick_cnt,
@@ -754,7 +754,7 @@ pub fn menu_load_slot(ctx: &mut CommandContext, quick: bool, idx: usize) {
         ctx.request_runtime_load(RuntimeSaveKind::Quick, idx);
     } else {
         ensure_slot_loaded_with_counts(
-            &ctx.project_dir,
+            SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
             false,
             save_cnt,
             quick_cnt,
@@ -774,7 +774,7 @@ fn slot_exists_for_menu_action(ctx: &mut CommandContext, quick: bool, idx: usize
     let quick_cnt = configured_save_count(ctx, true);
     if quick {
         ensure_slot_loaded_with_counts(
-            &ctx.project_dir,
+            SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
             true,
             save_cnt,
             quick_cnt,
@@ -789,7 +789,7 @@ fn slot_exists_for_menu_action(ctx: &mut CommandContext, quick: bool, idx: usize
             .unwrap_or(false)
     } else {
         ensure_slot_loaded_with_counts(
-            &ctx.project_dir,
+            SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
             false,
             save_cnt,
             quick_cnt,
@@ -857,7 +857,7 @@ fn local_save_file_exists(ctx: &CommandContext, kind: SaveKind, idx: usize) -> b
         kind,
         idx,
     );
-    original_save::read_slot_from_path(&path)
+    ctx.save_files().read_slot(&path)
         .map(|slot| slot.exist)
         .unwrap_or(false)
 }
@@ -1105,11 +1105,11 @@ fn write_slot_thumb_for_save_no(ctx: &mut CommandContext, save_no: usize) {
             config.thumb_type
         );
     }
-    remove_game_file(&path);
-    let result = match config.thumb_type {
-        SaveThumbType::Bmp => write_rgba_bmp_top_down(&path, &img),
-        SaveThumbType::Png => write_rgba_png_opaque(&path, &img),
+    let bytes = match config.thumb_type {
+        SaveThumbType::Bmp => encode_rgba_bmp_top_down(&img),
+        SaveThumbType::Png => encode_rgba_png_opaque(&img),
     };
+    let result = bytes.and_then(|bytes| ctx.save_files().write_path(&path, &bytes));
     if let Err(err) = result {
         eprintln!(
             "[SG_SAVE] failed to write save thumb {}: {err:#}",
@@ -1154,10 +1154,6 @@ fn unescape_str(s: &str) -> String {
         }
     }
     out
-}
-
-fn read_slot(path: &Path) -> Option<SaveSlotState> {
-    original_save::read_slot_from_path(path)
 }
 
 fn configured_chrkoe_count(ctx: &CommandContext) -> usize {
@@ -1648,22 +1644,21 @@ pub fn write_config_save(ctx: &CommandContext) {
     stream.push_bool(cfg.joypad_swap_ab);
     stream.push_bool(cfg.joypad_swap_xy);
 
-    if let Err(err) = original_save::write_config_save_file(&ctx.project_dir, &stream.into_inner())
-    {
+    let bytes = original_save::encode_config_save(&stream.into_inner());
+    if let Err(err) = ctx.save_files().write("config.sav", &bytes) {
         log::error!("[SG_SAVE] failed to write config.sav: {err:#}");
     }
 }
 
 fn load_config_save(ctx: &mut CommandContext) -> Result<()> {
     let mut cfg = original_config_defaults(ctx);
-    let config_path = original_save::save_dir(&ctx.project_dir).join("config.sav");
-    if !crate::resource::game_file_exists(&config_path) {
+    let Some(bytes) = ctx.save_files().read("config.sav")? else {
         resize_original_config_arrays(ctx, &mut cfg);
         ctx.globals.syscom.original_config = cfg;
         apply_original_config_to_runtime(ctx);
         return Ok(());
-    }
-    let (header, payload) = original_save::read_config_save_file(&ctx.project_dir)?;
+    };
+    let (header, payload) = original_save::decode_config_save(&bytes)?;
     save_versions::read_config(
         header,
         &payload,
@@ -1690,14 +1685,13 @@ fn write_read_flags(ctx: &CommandContext) -> Result<()> {
         flags.truncate(*flag_count);
         rows.push((scene_name.clone(), flags));
     }
-    original_save::write_read_save_file(&ctx.project_dir, &rows)
+    ctx.save_files().write("read.sav", &original_save::encode_read_save(&rows))
 }
 
 fn load_read_flags(ctx: &mut CommandContext) -> Result<()> {
-    let read_path = original_save::save_dir(&ctx.project_dir).join("read.sav");
-    if crate::resource::resolve_windows_case_insensitive_file(&read_path)?.is_none() {
+    let Some(bytes) = ctx.save_files().read("read.sav")? else {
         return Ok(());
-    }
+    };
     let metadata = ctx.scene_metadata()?;
     ctx.globals.read_flags.clear();
     for (scene_no, (_, flag_count)) in metadata.rows.iter().enumerate() {
@@ -1705,7 +1699,7 @@ fn load_read_flags(ctx: &mut CommandContext) -> Result<()> {
             .ensure_read_flag_count(scene_no as i64, *flag_count);
     }
 
-    let rows = match original_save::read_read_save_file(&ctx.project_dir) {
+    let rows = match original_save::decode_read_save(&bytes) {
         Ok(rows) => rows,
         Err(_) => return Ok(()),
     };
@@ -1879,7 +1873,8 @@ pub fn write_global_save(ctx: &CommandContext) {
     }
 
     let payload = stream.into_inner();
-    if let Err(err) = original_save::write_global_save_file(&ctx.project_dir, &payload) {
+    let bytes = original_save::encode_global_save(&payload);
+    if let Err(err) = ctx.save_files().write("global.sav", &bytes) {
         eprintln!("[SG_SAVE] failed to write global.sav: {err:#}");
     }
     if let Err(err) = write_read_flags(ctx) {
@@ -1888,9 +1883,8 @@ pub fn write_global_save(ctx: &CommandContext) {
 }
 
 pub fn load_global_save(ctx: &mut CommandContext) -> Result<()> {
-    let global_path = original_save::save_dir(&ctx.project_dir).join("global.sav");
-    if crate::resource::resolve_windows_case_insensitive_file(&global_path)?.is_some() {
-        let (header, payload) = original_save::read_global_save_file(&ctx.project_dir)?;
+    if let Some(bytes) = ctx.save_files().read("global.sav")? {
+        let (header, payload) = original_save::decode_global_save(&bytes)?;
         let fixed_flag_cnt = ctx
             .tables
             .gameexe
@@ -1944,7 +1938,7 @@ pub fn load_global_save(ctx: &mut CommandContext) -> Result<()> {
 }
 
 fn ensure_slot_loaded_with_counts(
-    project_dir: &Path,
+    files: SaveFiles<'_>,
     quick: bool,
     save_cnt: usize,
     quick_cnt: usize,
@@ -1962,7 +1956,7 @@ fn ensure_slot_loaded_with_counts(
         return;
     }
 
-    let path = slot_path_with_counts(project_dir, quick, idx, save_cnt, quick_cnt);
+    let path = slot_path_with_counts(files.project_dir(), quick, idx, save_cnt, quick_cnt);
     if save_load_trace_enabled() {
         let before_exist = slots.get(idx).map(|s| s.exist).unwrap_or(false);
         eprintln!(
@@ -1975,7 +1969,7 @@ fn ensure_slot_loaded_with_counts(
         );
     }
 
-    let next = match read_slot(&path) {
+    let next = match files.read_slot(&path) {
         Some(slot) => slot,
         None => {
             // Mirrors C_tnm_save_cache::data_none_flag: a missing/invalid save
@@ -1997,7 +1991,6 @@ pub(crate) fn read_save_flag_values(
     raw_idx: i64,
     flag_cnt: usize,
 ) -> Option<Vec<i64>> {
-    let project_dir = ctx.project_dir.clone();
     let save_cnt = configured_save_count(ctx, false);
     let quick_cnt = configured_save_count(ctx, true);
     let configured = if quick { quick_cnt } else { save_cnt };
@@ -2010,7 +2003,7 @@ pub(crate) fn read_save_flag_values(
     } else {
         &mut ctx.globals.syscom.save_slots
     };
-    ensure_slot_loaded_with_counts(&project_dir, quick, save_cnt, quick_cnt, slots, idx);
+    ensure_slot_loaded_with_counts(SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()), quick, save_cnt, quick_cnt, slots, idx);
     let slot = slots.get(idx).filter(|slot| slot.exist)?;
     let count = flag_cnt.min(original_save::SAVE_FLAG_MAX_CNT);
     Some(
@@ -2026,7 +2019,6 @@ pub(crate) fn write_save_flag_values(
     raw_idx: i64,
     values: &[i64],
 ) -> bool {
-    let project_dir = ctx.project_dir.clone();
     let save_cnt = configured_save_count(ctx, false);
     let quick_cnt = configured_save_count(ctx, true);
     let configured = if quick { quick_cnt } else { save_cnt };
@@ -2039,7 +2031,7 @@ pub(crate) fn write_save_flag_values(
     } else {
         &mut ctx.globals.syscom.save_slots
     };
-    ensure_slot_loaded_with_counts(&project_dir, quick, save_cnt, quick_cnt, slots, idx);
+    ensure_slot_loaded_with_counts(SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()), quick, save_cnt, quick_cnt, slots, idx);
     if !slots.get(idx).map(|slot| slot.exist).unwrap_or(false) {
         return false;
     }
@@ -2052,12 +2044,12 @@ pub(crate) fn write_save_flag_values(
             slot.values.insert(i as i32, value);
         }
     }
-    persist_slot_with_counts(&project_dir, quick, save_cnt, quick_cnt, slots, idx);
+    persist_slot_with_counts(SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()), quick, save_cnt, quick_cnt, slots, idx);
     true
 }
 
 fn sync_slots_from_disk_with_counts(
-    project_dir: &Path,
+    files: SaveFiles<'_>,
     quick: bool,
     save_cnt: usize,
     quick_cnt: usize,
@@ -2068,7 +2060,7 @@ fn sync_slots_from_disk_with_counts(
         slots.resize_with(count, SaveSlotState::default);
     }
     for idx in 0..count {
-        ensure_slot_loaded_with_counts(project_dir, quick, save_cnt, quick_cnt, slots, idx);
+        ensure_slot_loaded_with_counts(files, quick, save_cnt, quick_cnt, slots, idx);
     }
 }
 
@@ -2079,12 +2071,11 @@ pub(crate) fn sync_save_slots_from_disk(ctx: &mut CommandContext, quick: bool) {
             if quick { "quick" } else { "normal" }
         );
     }
-    let project_dir = ctx.project_dir.clone();
     let save_cnt = configured_save_count(ctx, false);
     let quick_cnt = configured_save_count(ctx, true);
     if quick {
         sync_slots_from_disk_with_counts(
-            &project_dir,
+            SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
             true,
             save_cnt,
             quick_cnt,
@@ -2093,7 +2084,7 @@ pub(crate) fn sync_save_slots_from_disk(ctx: &mut CommandContext, quick: bool) {
         );
     } else {
         sync_slots_from_disk_with_counts(
-            &project_dir,
+            SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
             false,
             save_cnt,
             quick_cnt,
@@ -2104,7 +2095,7 @@ pub(crate) fn sync_save_slots_from_disk(ctx: &mut CommandContext, quick: bool) {
 }
 
 fn persist_slot_with_counts(
-    project_dir: &Path,
+    files: SaveFiles<'_>,
     quick: bool,
     save_cnt: usize,
     quick_cnt: usize,
@@ -2120,10 +2111,7 @@ fn persist_slot_with_counts(
         return;
     }
 
-    let path = slot_path_with_counts(project_dir, quick, idx, save_cnt, quick_cnt);
-    let Some(existing_path) = crate::resource::resolve_game_file(&path).ok().flatten() else {
-        return;
-    };
+    let path = slot_path_with_counts(files.project_dir(), quick, idx, save_cnt, quick_cnt);
     let header = original_save::OriginalSaveHeader::from_slot(slot, slot.packed_data_size);
 
     // C_tnm_save_cache::save_cache() calls clear_cache(save_no) before opening
@@ -2135,10 +2123,10 @@ fn persist_slot_with_counts(
         slot.header_cache_valid = false;
     }
 
-    if let Err(err) = original_save::write_header_in_place(&existing_path, &header) {
+    if let Err(err) = files.update_header(&path, &header) {
         eprintln!(
             "[SG_SAVE] failed to update original save header {}: {err:#}",
-            existing_path.display()
+            path.display()
         );
     }
 }
@@ -2153,7 +2141,7 @@ fn slot_thumb_save_no(save_cnt: usize, quick_cnt: usize, quick: bool, idx: usize
 }
 
 fn remove_thumb_file(
-    project_dir: &Path,
+    files: SaveFiles<'_>,
     save_cnt: usize,
     quick_cnt: usize,
     quick: bool,
@@ -2164,11 +2152,14 @@ fn remove_thumb_file(
         return;
     }
     let save_no = slot_thumb_save_no(save_cnt, quick_cnt, quick, idx);
-    remove_game_file(&thumb_path_for_no_with_config(project_dir, config, save_no));
+    let path = thumb_path_for_no_with_config(files.project_dir(), config, save_no);
+    if let Err(err) = files.remove_path(&path) {
+        log::warn!("could not remove save thumbnail: {err:#}");
+    }
 }
 
 fn copy_thumb_file(
-    project_dir: &Path,
+    files: SaveFiles<'_>,
     save_cnt: usize,
     quick_cnt: usize,
     quick: bool,
@@ -2181,8 +2172,14 @@ fn copy_thumb_file(
     }
     let src_no = slot_thumb_save_no(save_cnt, quick_cnt, quick, src);
     let dst_no = slot_thumb_save_no(save_cnt, quick_cnt, quick, dst);
-    let src_path = thumb_path_for_no_with_config(project_dir, config, src_no);
-    let dst_path = thumb_path_for_no_with_config(project_dir, config, dst_no);
+    let src_path = thumb_path_for_no_with_config(files.project_dir(), config, src_no);
+    let dst_path = thumb_path_for_no_with_config(files.project_dir(), config, dst_no);
+    if files.is_host() {
+        if let Err(err) = files.copy_path(&src_path, &dst_path) {
+            log::warn!("could not copy save thumbnail: {err:#}");
+        }
+        return;
+    }
     if let Some(src_path) = crate::resource::resolve_game_file(&src_path).ok().flatten() {
         if let Some(parent) = dst_path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -2194,7 +2191,7 @@ fn copy_thumb_file(
 }
 
 fn swap_thumb_file(
-    project_dir: &Path,
+    files: SaveFiles<'_>,
     save_cnt: usize,
     quick_cnt: usize,
     quick: bool,
@@ -2207,8 +2204,14 @@ fn swap_thumb_file(
     }
     let a_no = slot_thumb_save_no(save_cnt, quick_cnt, quick, a);
     let b_no = slot_thumb_save_no(save_cnt, quick_cnt, quick, b);
-    let pa = thumb_path_for_no_with_config(project_dir, config, a_no);
-    let pb = thumb_path_for_no_with_config(project_dir, config, b_no);
+    let pa = thumb_path_for_no_with_config(files.project_dir(), config, a_no);
+    let pb = thumb_path_for_no_with_config(files.project_dir(), config, b_no);
+    if files.is_host() {
+        if let Err(err) = files.swap_paths(&pa, &pb) {
+            log::warn!("could not exchange save thumbnails: {err:#}");
+        }
+        return;
+    }
     let tmp = pa.with_extension(format!(
         "{}.swap",
         pa.extension().and_then(|v| v.to_str()).unwrap_or("tmp")
@@ -2300,7 +2303,7 @@ fn swap_save_file(
 }
 
 fn copy_slot(
-    project_dir: &Path,
+    files: SaveFiles<'_>,
     quick: bool,
     save_cnt: usize,
     quick_cnt: usize,
@@ -2309,17 +2312,29 @@ fn copy_slot(
     src: usize,
     dst: usize,
 ) -> bool {
-    ensure_slot_loaded_with_counts(project_dir, quick, save_cnt, quick_cnt, slots, src);
+    ensure_slot_loaded_with_counts(files, quick, save_cnt, quick_cnt, slots, src);
     let Some(src_slot) = slots.get(src).cloned() else {
         return false;
     };
     if !src_slot.exist {
         return false;
     }
+    if src == dst {
+        return true;
+    }
+    if files.is_host() {
+        let src_path = slot_path_with_counts(files.project_dir(), quick, src, save_cnt, quick_cnt);
+        let dst_path = slot_path_with_counts(files.project_dir(), quick, dst, save_cnt, quick_cnt);
+        if let Err(err) = files.copy_path(&src_path, &dst_path) {
+            log::error!("could not copy save slot: {err:#}");
+            return false;
+        }
+    } else {
+        copy_save_file(files.project_dir(), quick, save_cnt, quick_cnt, src, dst);
+    }
     *ensure_slot(slots, dst) = src_slot;
-    copy_save_file(project_dir, quick, save_cnt, quick_cnt, src, dst);
     copy_thumb_file(
-        project_dir,
+        files,
         save_cnt,
         quick_cnt,
         quick,
@@ -2331,7 +2346,7 @@ fn copy_slot(
 }
 
 fn change_slot(
-    project_dir: &Path,
+    files: SaveFiles<'_>,
     quick: bool,
     save_cnt: usize,
     quick_cnt: usize,
@@ -2340,20 +2355,32 @@ fn change_slot(
     a: usize,
     b: usize,
 ) -> bool {
-    ensure_slot_loaded_with_counts(project_dir, quick, save_cnt, quick_cnt, slots, a);
-    ensure_slot_loaded_with_counts(project_dir, quick, save_cnt, quick_cnt, slots, b);
+    ensure_slot_loaded_with_counts(files, quick, save_cnt, quick_cnt, slots, a);
+    ensure_slot_loaded_with_counts(files, quick, save_cnt, quick_cnt, slots, b);
     let max_idx = a.max(b);
     if slots.len() <= max_idx {
         slots.resize_with(max_idx + 1, SaveSlotState::default);
     }
+    if a == b {
+        return true;
+    }
+    if files.is_host() {
+        let first = slot_path_with_counts(files.project_dir(), quick, a, save_cnt, quick_cnt);
+        let second = slot_path_with_counts(files.project_dir(), quick, b, save_cnt, quick_cnt);
+        if let Err(err) = files.swap_paths(&first, &second) {
+            log::error!("could not exchange save slots: {err:#}");
+            return false;
+        }
+    } else {
+        swap_save_file(files.project_dir(), quick, save_cnt, quick_cnt, a, b);
+    }
     slots.swap(a, b);
-    swap_save_file(project_dir, quick, save_cnt, quick_cnt, a, b);
-    swap_thumb_file(project_dir, save_cnt, quick_cnt, quick, thumb_config, a, b);
+    swap_thumb_file(files, save_cnt, quick_cnt, quick, thumb_config, a, b);
     true
 }
 
 fn delete_slot(
-    project_dir: &Path,
+    files: SaveFiles<'_>,
     quick: bool,
     save_cnt: usize,
     quick_cnt: usize,
@@ -2361,9 +2388,9 @@ fn delete_slot(
     slots: &mut Vec<SaveSlotState>,
     idx: usize,
 ) -> bool {
-    ensure_slot_loaded_with_counts(project_dir, quick, save_cnt, quick_cnt, slots, idx);
+    ensure_slot_loaded_with_counts(files, quick, save_cnt, quick_cnt, slots, idx);
     let existed = slots.get(idx).map(|s| s.exist).unwrap_or(false);
-    let mut deleted = SaveSlotState {
+    let deleted = SaveSlotState {
         header_cache_valid: true,
         ..Default::default()
     };
@@ -2371,10 +2398,13 @@ fn delete_slot(
     // observes the missing file. We already know the deletion result here, so
     // retain the equivalent negative-cache state directly.
 
+    let path = slot_path_with_counts(files.project_dir(), quick, idx, save_cnt, quick_cnt);
+    if let Err(err) = files.remove_path(&path) {
+        log::error!("could not delete save slot: {err:#}");
+        return false;
+    }
     *ensure_slot(slots, idx) = deleted;
-    let path = slot_path_with_counts(project_dir, quick, idx, save_cnt, quick_cnt);
-    remove_game_file(&path);
-    remove_thumb_file(project_dir, save_cnt, quick_cnt, quick, thumb_config, idx);
+    remove_thumb_file(files, save_cnt, quick_cnt, quick, thumb_config, idx);
     existed
 }
 
@@ -4096,10 +4126,20 @@ fn push_i32_le(out: &mut Vec<u8>, value: i32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-fn write_rgba_bmp_top_down(path: &Path, img: &RgbaImage) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+fn encode_rgba_png_opaque(img: &RgbaImage) -> Result<Vec<u8>> {
+    let opaque = opaque_rgba(img);
+    let mut bytes = Vec::new();
+    image::ImageEncoder::write_image(
+        image::codecs::png::PngEncoder::new(&mut bytes),
+        &opaque.rgba,
+        opaque.width,
+        opaque.height,
+        image::ColorType::Rgba8.into(),
+    )?;
+    Ok(bytes)
+}
+
+fn encode_rgba_bmp_top_down(img: &RgbaImage) -> Result<Vec<u8>> {
     let width = img.width;
     let height = img.height;
     if width == 0 || height == 0 {
@@ -4133,9 +4173,7 @@ fn write_rgba_bmp_top_down(path: &Path, img: &RgbaImage) -> Result<()> {
         out.push(px[0]);
         out.push(px[3]);
     }
-    fs::write(path, out)?;
-    mark_game_file_written(path);
-    Ok(())
+    Ok(out)
 }
 
 fn resize_rgba(img: &RgbaImage, w: u32, h: u32) -> RgbaImage {
@@ -4868,7 +4906,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             {
                 let quick_cnt = configured_save_count(ctx, true);
                 ensure_slot_loaded_with_counts(
-                    &ctx.project_dir,
+                    SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                     false,
                     save_cnt,
                     quick_cnt,
@@ -4902,7 +4940,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             {
                 let quick_cnt = configured_save_count(ctx, true);
                 ensure_slot_loaded_with_counts(
-                    &ctx.project_dir,
+                    SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                     false,
                     save_cnt,
                     quick_cnt,
@@ -4929,7 +4967,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let idx = raw_idx as usize;
             let quick_cnt = configured_save_count(ctx, true);
             ensure_slot_loaded_with_counts(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 false,
                 save_cnt,
                 quick_cnt,
@@ -4955,7 +4993,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
                 .to_string();
             ctx.globals.syscom.save_slots[idx].comment = comment;
             persist_slot_with_counts(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 false,
                 save_cnt,
                 quick_cnt,
@@ -4973,7 +5011,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let idx = raw_idx as usize;
             let quick_cnt = configured_save_count(ctx, true);
             ensure_slot_loaded_with_counts(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 false,
                 save_cnt,
                 quick_cnt,
@@ -5020,7 +5058,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let idx = raw_idx as usize;
             let quick_cnt = configured_save_count(ctx, true);
             ensure_slot_loaded_with_counts(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 false,
                 save_cnt,
                 quick_cnt,
@@ -5063,7 +5101,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
                 }
             }
             persist_slot_with_counts(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 false,
                 save_cnt,
                 quick_cnt,
@@ -5091,7 +5129,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             {
                 let save_cnt = configured_save_count(ctx, false);
                 ensure_slot_loaded_with_counts(
-                    &ctx.project_dir,
+                    SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                     true,
                     save_cnt,
                     quick_cnt,
@@ -5125,7 +5163,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             {
                 let save_cnt = configured_save_count(ctx, false);
                 ensure_slot_loaded_with_counts(
-                    &ctx.project_dir,
+                    SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                     true,
                     save_cnt,
                     quick_cnt,
@@ -5152,7 +5190,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let idx = raw_idx as usize;
             let save_cnt = configured_save_count(ctx, false);
             ensure_slot_loaded_with_counts(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 true,
                 save_cnt,
                 quick_cnt,
@@ -5176,7 +5214,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
                 .to_string();
             ctx.globals.syscom.quick_save_slots[idx].comment = comment;
             persist_slot_with_counts(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 true,
                 save_cnt,
                 quick_cnt,
@@ -5194,7 +5232,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let idx = raw_idx as usize;
             let save_cnt = configured_save_count(ctx, false);
             ensure_slot_loaded_with_counts(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 true,
                 save_cnt,
                 quick_cnt,
@@ -5239,7 +5277,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let idx = raw_idx as usize;
             let save_cnt = configured_save_count(ctx, false);
             ensure_slot_loaded_with_counts(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 true,
                 save_cnt,
                 quick_cnt,
@@ -5282,7 +5320,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
                 }
             }
             persist_slot_with_counts(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 true,
                 save_cnt,
                 quick_cnt,
@@ -5302,7 +5340,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
                 0,
             );
             let v = if ctx.globals.syscom.end_save_exists
-                || crate::resource::game_file_exists(&end_path)
+                || ctx.save_files().read_slot(&end_path).is_some()
             {
                 1
             } else {
@@ -5318,7 +5356,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let quick_cnt = configured_save_count(ctx, true);
             let thumb_config = save_thumb_config(ctx);
             let ok = copy_slot(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 false,
                 save_cnt,
                 quick_cnt,
@@ -5338,7 +5376,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let quick_cnt = configured_save_count(ctx, true);
             let thumb_config = save_thumb_config(ctx);
             let ok = copy_slot(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 true,
                 save_cnt,
                 quick_cnt,
@@ -5358,7 +5396,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let quick_cnt = configured_save_count(ctx, true);
             let thumb_config = save_thumb_config(ctx);
             let ok = change_slot(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 false,
                 save_cnt,
                 quick_cnt,
@@ -5378,7 +5416,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let quick_cnt = configured_save_count(ctx, true);
             let thumb_config = save_thumb_config(ctx);
             let ok = change_slot(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 true,
                 save_cnt,
                 quick_cnt,
@@ -5397,7 +5435,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let quick_cnt = configured_save_count(ctx, true);
             let thumb_config = save_thumb_config(ctx);
             let ok = delete_slot(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 false,
                 save_cnt,
                 quick_cnt,
@@ -5415,7 +5453,7 @@ pub fn dispatch(ctx: &mut CommandContext, form_id: u32, args: &[Value]) -> Resul
             let quick_cnt = configured_save_count(ctx, true);
             let thumb_config = save_thumb_config(ctx);
             let ok = delete_slot(
-                &ctx.project_dir,
+                SaveFiles::new(&ctx.project_dir, ctx.save_store.as_deref()),
                 true,
                 save_cnt,
                 quick_cnt,
