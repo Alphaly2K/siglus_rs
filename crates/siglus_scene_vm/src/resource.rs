@@ -25,6 +25,11 @@ use std::sync::Arc;
 pub trait SiglusResourceSource: Send + Sync {
     fn query_size(&self, key: &str) -> Result<Option<u64>>;
     fn read_range(&self, key: &str, offset: u64, output: &mut [u8]) -> Result<usize>;
+
+    /// Native directory Hosts can resolve folders used by local font lookup.
+    fn resolve_local_directory(&self, _key: &str) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
 }
 
 pub(crate) type ProjectFiles = (PathBuf, Arc<dyn SiglusResourceSource>);
@@ -504,8 +509,13 @@ pub(crate) fn invalidate_game_path_cache(_path: &Path) {
 }
 
 pub(crate) fn resolve_windows_case_insensitive_path(path: &Path) -> Result<Option<PathBuf>> {
-    if let Some(exists) = project_file_exists(path) {
-        return Ok(exists?.then(|| path.to_path_buf()));
+    if let Some(result) = with_project_file(path, |source, key| {
+        if !key.is_empty() && source.query_size(key)?.is_some() {
+            return Ok(Some(path.to_path_buf()));
+        }
+        source.resolve_local_directory(key)
+    }) {
+        return result;
     }
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
@@ -1197,7 +1207,13 @@ pub(crate) fn load_runtime_scene_pck(
         ScenePck::load_lazy_from_bytes(read_file_bytes(&path)?, &options)
     }
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    ScenePck::load_lazy(&path, &load_scene_pck_decode_options(project_dir)?)
+    {
+        let options = load_scene_pck_decode_options(project_dir)?;
+        if let Some(bytes) = read_project_file(&path) {
+            return ScenePck::load_lazy_from_bytes(bytes?, &options);
+        }
+        ScenePck::load_lazy(&path, &options)
+    }
 }
 
 pub fn find_scene_pck_path(project_dir: &Path) -> Result<PathBuf> {
@@ -1595,25 +1611,46 @@ pub fn find_audio_path_with_append_dir(
 static APPEND_DIRS_CACHE: std::sync::Mutex<Option<HashMap<PathBuf, Vec<String>>>> =
     std::sync::Mutex::new(None);
 
-pub(crate) fn ordered_append_dirs(project_dir: &Path, current_append_dir: &str) -> Vec<String> {
+type MountedAppendDirs = (std::sync::Weak<dyn SiglusResourceSource>, Vec<String>);
+thread_local! {
+    static MOUNTED_APPEND_DIRS: std::cell::RefCell<Option<MountedAppendDirs>> = const { std::cell::RefCell::new(None) };
+}
+
+fn project_append_dirs(project_dir: &Path) -> Vec<String> {
+    if let Some((_, files)) = current_project_files() {
+        let files = Arc::downgrade(&files);
+        let cached = MOUNTED_APPEND_DIRS.with(|cache| {
+            cache
+                .borrow()
+                .as_ref()
+                .and_then(|(source, dirs)| source.ptr_eq(&files).then(|| dirs.clone()))
+        });
+        return cached.unwrap_or_else(|| {
+            let dirs = parse_select_ini_append_dirs(project_dir);
+            MOUNTED_APPEND_DIRS.with(|cache| cache.replace(Some((files, dirs.clone()))));
+            dirs
+        });
+    }
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     let project_key = native_cache_key(project_dir);
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     let project_key = project_dir.to_path_buf();
 
-    let mut dirs = {
-        let mut guard = APPEND_DIRS_CACHE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cache = guard.get_or_insert_with(HashMap::new);
-        if let Some(cached_dirs) = cache.get(&project_key) {
-            cached_dirs.clone()
-        } else {
-            let dirs = parse_select_ini_append_dirs(project_dir);
-            cache.insert(project_key, dirs.clone());
-            dirs
-        }
-    };
+    let mut guard = APPEND_DIRS_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some(cached_dirs) = cache.get(&project_key) {
+        cached_dirs.clone()
+    } else {
+        let dirs = parse_select_ini_append_dirs(project_dir);
+        cache.insert(project_key, dirs.clone());
+        dirs
+    }
+}
+
+pub(crate) fn ordered_append_dirs(project_dir: &Path, current_append_dir: &str) -> Vec<String> {
+    let mut dirs = project_append_dirs(project_dir);
     if dirs.is_empty() {
         dirs.push(String::new());
     }
