@@ -5742,7 +5742,10 @@ mod omv_conversion_parity_tests {
     /// repacked copy, full size and downscaled (real OMVs, when present).
     #[test]
     fn decoder_planes_convert_like_packed_planes() {
-        use super::{DecoderOmvPlanes, convert_omv_frame_to_size, convert_omv_planes_to_size};
+        use super::{
+            DecoderOmvPlanes, convert_omv_frame_to_size, convert_omv_planes_to_size, open_omv_ogg,
+            read_omv_index,
+        };
         let files = [
             "/Users/xmoe/Documents/GameData/mov/ef_wind_dust01.omv",
             "/Users/xmoe/Documents/GameData/mov/ef_wind04.omv",
