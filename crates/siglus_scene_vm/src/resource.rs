@@ -17,9 +17,86 @@ use std::collections::HashMap;
 use std::fs;
 #[cfg(target_os = "horizon")]
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
-use std::path::Component;
+/// Read-only project files supplied by an embedding Host. Keys use `/` and
+/// the Host resolves ASCII case-insensitive names. Reads may be short.
+pub trait SiglusResourceSource: Send + Sync {
+    fn query_size(&self, key: &str) -> Result<Option<u64>>;
+    fn read_range(&self, key: &str, offset: u64, output: &mut [u8]) -> Result<usize>;
+}
+
+type ProjectFiles = (PathBuf, Arc<dyn SiglusResourceSource>);
+thread_local! {
+    static PROJECT_FILES: std::cell::RefCell<Option<ProjectFiles>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Scope project lookups to the current VM call. Other sessions can use their
+/// own sources or the directory loader, including in nested calls.
+pub fn with_project_files<T>(files: Option<ProjectFiles>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<ProjectFiles>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROJECT_FILES.replace(self.0.take());
+        }
+    }
+    let _restore = Restore(PROJECT_FILES.replace(files));
+    run()
+}
+
+fn with_project_file<T>(
+    path: &Path,
+    run: impl FnOnce(&dyn SiglusResourceSource, &str) -> Result<T>,
+) -> Option<Result<T>> {
+    let (root, source) = PROJECT_FILES.with(|files| files.borrow().clone())?;
+    Some((|| {
+        let path = path.strip_prefix(root)?;
+        let mut parts = Vec::new();
+        for part in path.components() {
+            let Component::Normal(value) = part else {
+                bail!("invalid Siglus project resource path");
+            };
+            let name = value
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 resource path"))?;
+            if name.contains(['\\', ':']) {
+                bail!("invalid Siglus project resource path");
+            }
+            parts.push(name);
+        }
+        run(source.as_ref(), &parts.join("/"))
+    })())
+}
+
+fn project_file_exists(path: &Path) -> Option<Result<bool>> {
+    with_project_file(path, |source, key| {
+        Ok(!key.is_empty() && source.query_size(key)?.is_some())
+    })
+}
+
+pub(crate) fn read_project_file(path: &Path) -> Option<Result<Vec<u8>>> {
+    with_project_file(path, |source, key| {
+        let size = source
+            .query_size(key)?
+            .ok_or_else(|| anyhow::anyhow!("missing project resource: {key}"))?;
+        let size = usize::try_from(size)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size)?;
+        bytes.resize(size, 0);
+        let mut offset = 0;
+        while offset < size {
+            let count = source.read_range(key, offset as u64, &mut bytes[offset..])?;
+            if count == 0 || count > size - offset {
+                bail!("invalid read length for project resource: {key}");
+            }
+            offset += count;
+        }
+        Ok(bytes)
+    })
+}
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use crate::wasm_vfs::SiglusVfs;
@@ -57,12 +134,12 @@ pub(crate) fn wasm_path_is_dir(path: &Path) -> bool {
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
+fn read_directory_file_bytes(path: &Path) -> Result<Vec<u8>> {
     crate::wasm_vfs::WasmDirectoryVfs::new().read_all(&path_to_wasm_vfs(path))
 }
 
 #[cfg(target_os = "horizon")]
-pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
+fn read_directory_file_bytes(path: &Path) -> Result<Vec<u8>> {
     let Some(resolved) = resolve_windows_case_insensitive_file(path)? else {
         bail!("file not found: {}", path.display());
     };
@@ -86,7 +163,7 @@ pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
     not(target_os = "horizon"),
     not(all(target_arch = "wasm32", target_os = "unknown"))
 ))]
-pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
+fn read_directory_file_bytes(path: &Path) -> Result<Vec<u8>> {
     let Some(resolved) = resolve_windows_case_insensitive_file(path)? else {
         bail!("file not found: {}", path.display());
     };
@@ -105,6 +182,10 @@ pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
         }
         Err(err) => Err(err.into()),
     }
+}
+
+pub fn read_file_bytes(path: &Path) -> Result<Vec<u8>> {
+    read_project_file(path).unwrap_or_else(|| read_directory_file_bytes(path))
 }
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -414,6 +495,9 @@ pub(crate) fn invalidate_game_path_cache(_path: &Path) {
 }
 
 pub(crate) fn resolve_windows_case_insensitive_path(path: &Path) -> Result<Option<PathBuf>> {
+    if let Some(exists) = project_file_exists(path) {
+        return Ok(exists?.then(|| path.to_path_buf()));
+    }
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
         // `siglusFileExists` already uses the browser-side case-insensitive
@@ -463,6 +547,9 @@ pub(crate) fn resolve_windows_case_insensitive_path(path: &Path) -> Result<Optio
 }
 
 pub(crate) fn resolve_windows_case_insensitive_file(path: &Path) -> Result<Option<PathBuf>> {
+    if let Some(exists) = project_file_exists(path) {
+        return Ok(exists?.then(|| path.to_path_buf()));
+    }
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
         return Ok(wasm_path_is_file(path).then_some(path.to_path_buf()));
@@ -569,6 +656,13 @@ pub(crate) fn open_game_file(path: &Path) -> Result<fs::File> {
 /// instead.  Callers that only need the file length must use this helper rather
 /// than depending on a host-specific metadata type.
 pub(crate) fn game_file_len(path: &Path) -> Result<u64> {
+    if let Some(result) = with_project_file(path, |source, key| {
+        source
+            .query_size(key)?
+            .ok_or_else(|| anyhow::anyhow!("missing project resource: {key}"))
+    }) {
+        return result;
+    }
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
         return Ok(read_file_bytes(path)?.len() as u64);

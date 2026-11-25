@@ -61,7 +61,13 @@ pub fn load_image_any(path: &Path, g00_frame_index: usize) -> Result<RgbaImage> 
                     .with_context(|| format!("decode image {:?}", path))?
             };
             #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            let img = image::open(path).with_context(|| format!("decode image {:?}", path))?;
+            let img = if let Some(bytes) = crate::resource::read_project_file(path) {
+                let format = image::ImageFormat::from_path(path)?;
+                image::load_from_memory_with_format(&bytes?, format)
+                    .with_context(|| format!("decode image {:?}", path))?
+            } else {
+                image::open(path).with_context(|| format!("decode image {:?}", path))?
+            };
             let rgba = img.to_rgba8();
             let (w, h) = rgba.dimensions();
             Ok(RgbaImage {
