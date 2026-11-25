@@ -23,8 +23,13 @@ pub struct ToneCurveRuntime {
 
 impl ToneCurveRuntime {
     pub fn new(project_dir: &Path) -> Self {
+        let gameexe = load_gameexe_config(project_dir);
+        Self::from_gameexe(project_dir, gameexe.as_ref())
+    }
+
+    pub(crate) fn from_gameexe(project_dir: &Path, gameexe: Option<&GameexeConfig>) -> Self {
         let mut out = Self::default();
-        if let Some(path) = find_tonecurve_path(project_dir) {
+        if let Some(path) = gameexe.and_then(|cfg| find_tonecurve_path(project_dir, cfg)) {
             out.source_path = Some(path.clone());
             out.rows = load_tonecurve_rows(&path).ok();
         }
@@ -86,8 +91,7 @@ impl ToneCurveRuntime {
     }
 }
 
-fn find_tonecurve_path(project_dir: &Path) -> Option<PathBuf> {
-    let cfg = load_gameexe_config(project_dir)?;
+fn find_tonecurve_path(project_dir: &Path, cfg: &GameexeConfig) -> Option<PathBuf> {
     let rel = cfg.get_unquoted("TONECURVE_FILE")?;
     if rel.trim().is_empty() {
         return None;

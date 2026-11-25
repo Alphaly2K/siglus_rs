@@ -49,7 +49,7 @@ use crate::layer::{
 };
 use crate::movie::MovieManager;
 use crate::text_render::{FontCache, TextStyle, embedded_default_font_names};
-use siglus_assets::scene_pck::{ScenePck, ScenePckDecodeOptions};
+use siglus_assets::scene_pck::ScenePck;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -456,6 +456,8 @@ pub struct CommandContext {
     /// Scene names/read-flag shapes derived from the resident Scene.pck.
     /// Replaced when the active append changes, like tnm_reload_scene_pck().
     scene_metadata: RefCell<Option<(String, Arc<SceneMetadata>)>>,
+    scene_source: Option<Arc<dyn crate::host::SiglusBootSource>>,
+    host_initial_append: Option<crate::resource::SelectIniAppendEntry>,
 
     /// Value stack used by form handlers to return results.
     pub stack: Vec<Value>,
@@ -1501,6 +1503,17 @@ impl CommandContext {
     pub fn new(project_dir: PathBuf) -> Self {
         let mut unknown = unknown::UnknownOpRecorder::default();
         let tables = tables::AssetTables::load(&project_dir, &mut unknown);
+        let initial_append = crate::resource::initial_select_ini_append(&project_dir);
+        Self::new_with_boot_data(project_dir, tables, unknown, initial_append, None)
+    }
+
+    pub(crate) fn new_with_boot_data(
+        project_dir: PathBuf,
+        tables: tables::AssetTables,
+        unknown: unknown::UnknownOpRecorder,
+        initial_append: crate::resource::SelectIniAppendEntry,
+        scene_source: Option<Arc<dyn crate::host::SiglusBootSource>>,
+    ) -> Self {
         // All native entry points (including the desktop executable) must
         // recover/cache the PSB key before script execution can create a model.
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1509,14 +1522,13 @@ impl CommandContext {
         let emote_key = crate::resource::load_project_emote_key(&project_dir)
             .ok()
             .flatten();
-        let initial_append = crate::resource::initial_select_ini_append(&project_dir);
-
         let ids = constants::RuntimeConstants::default();
 
         let audio = AudioHub::new();
         let mut images = ImageManager::new(project_dir.clone());
         let solid_white = images.solid_rgba((255, 255, 255, 255));
-        let tonecurve = tonecurve::ToneCurveRuntime::new(&project_dir);
+        let tonecurve = tonecurve::ToneCurveRuntime::from_gameexe(&project_dir, tables.gameexe.as_ref());
+        let host_initial_append = scene_source.as_ref().map(|_| initial_append.clone());
 
         let mut ctx = Self {
             images,
@@ -1532,6 +1544,8 @@ impl CommandContext {
             solid_white,
             tables,
             scene_metadata: RefCell::new(None),
+            scene_source,
+            host_initial_append,
             stack: Vec::new(),
             unknown,
             ids,
@@ -1613,7 +1627,9 @@ impl CommandContext {
     /// Restore the startup append selected by the first `Select.ini` entry,
     /// matching `tnm_scene_proc_restart_from_menu_scene()`.
     pub fn reset_active_append_to_initial(&mut self) {
-        let append = crate::resource::initial_select_ini_append(&self.project_dir);
+        let append = self.host_initial_append.clone().unwrap_or_else(|| {
+            crate::resource::initial_select_ini_append(&self.project_dir)
+        });
         self.set_active_append(append.dir, append.name);
     }
 
@@ -2138,6 +2154,14 @@ impl CommandContext {
         Ok(())
     }
 
+    pub(crate) fn load_scene_pack(&self, append: &str) -> Result<ScenePck> {
+        crate::resource::load_runtime_scene_pck(
+            &self.project_dir,
+            append,
+            self.scene_source.as_deref(),
+        )
+    }
+
     pub(crate) fn scene_metadata(&self) -> Result<Arc<SceneMetadata>> {
         let active_append = self.globals.append_dir.clone();
         if let Some((cached_append, metadata)) = self.scene_metadata.borrow().as_ref()
@@ -2146,40 +2170,7 @@ impl CommandContext {
             return Ok(Arc::clone(metadata));
         }
 
-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        let pck = {
-            let scene_pck_path =
-                crate::resource::find_scene_pck_path_for_append(&self.project_dir, &active_append)?;
-            let bytes = crate::resource::read_file_bytes(&scene_pck_path)?;
-            let key_cfg = ["key.toml", "Key.toml"].iter().find_map(|name| {
-                let p = self.project_dir.join(name);
-                if !crate::resource::wasm_path_is_file(&p) {
-                    return None;
-                }
-                let text = crate::resource::read_file_to_string(&p).ok()?;
-                siglus_assets::key_toml::parse_key_toml(&text).ok()
-            });
-            let exe = key_cfg
-                .as_ref()
-                .and_then(|cfg| cfg.exe_key16)
-                .map(|v| v.to_vec());
-            let string_encryption_override = key_cfg
-                .map(|cfg| cfg.override_string_encryption)
-                .unwrap_or_default();
-            let opt = ScenePckDecodeOptions {
-                exe_angou_element: exe,
-                easy_angou_code: Some(siglus_assets::keys::SCENE_KEY.to_vec()),
-                string_encryption_override,
-            };
-            ScenePck::load_lazy_from_bytes(bytes, &opt)?
-        };
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        let pck = {
-            let scene_pck_path =
-                crate::resource::find_scene_pck_path_for_append(&self.project_dir, &active_append)?;
-            let opt = crate::resource::load_scene_pck_decode_options(&self.project_dir)?;
-            ScenePck::load_lazy(&scene_pck_path, &opt)?
-        };
+        let pck = self.load_scene_pack(&active_append)?;
         self.install_scene_metadata(&active_append, &pck)?;
         let slot = self.scene_metadata.borrow();
         Ok(Arc::clone(
@@ -2337,7 +2328,10 @@ impl CommandContext {
         self.globals.syscom.font_list = font_list;
         self.globals.syscom.return_scene_once = return_scene_once;
 
-        self.tonecurve = tonecurve::ToneCurveRuntime::new(&self.project_dir);
+        self.tonecurve = tonecurve::ToneCurveRuntime::from_gameexe(
+            &self.project_dir,
+            self.tables.gameexe.as_ref(),
+        );
         self.excall_state = ExcallCompatState::default();
         self.render_object_keys_scratch.clear();
         self.render_object_keys_scratch.shrink_to_fit();

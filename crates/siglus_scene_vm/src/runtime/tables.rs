@@ -472,13 +472,11 @@ impl Default for AssetTables {
 
 impl AssetTables {
     pub fn load(project_dir: &Path, unknown: &mut UnknownOpRecorder) -> Self {
-        let mut out = Self::default();
-
         let gameexe_path = match crate::resource::find_initial_gameexe_path(project_dir) {
             Ok(path) => path,
             Err(_) => {
                 unknown.record_note("gameexe.missing");
-                return out;
+                return Self::default();
             }
         };
 
@@ -486,7 +484,7 @@ impl AssetTables {
             Ok(b) => b,
             Err(e) => {
                 unknown.record_note(&format!("gameexe.read.failed:{e}"));
-                return out;
+                return Self::default();
             }
         };
 
@@ -499,7 +497,7 @@ impl AssetTables {
                 Ok(text) => (text, None),
                 Err(e) => {
                     unknown.record_note(&format!("gameexe.ini.decode.failed:{e}"));
-                    return out;
+                    return Self::default();
                 }
             }
         } else {
@@ -516,11 +514,23 @@ impl AssetTables {
                 Ok((text, report)) => (text, Some(report)),
                 Err(e) => {
                     unknown.record_note(&format!("gameexe.decode.failed:{e}"));
-                    return out;
+                    return Self::default();
                 }
             }
         };
 
+        let append = crate::resource::initial_select_ini_append(project_dir);
+        Self::from_gameexe(project_dir, &append.dir, text, report, unknown)
+    }
+
+    pub(crate) fn from_gameexe(
+        project_dir: &Path,
+        append: &str,
+        text: String,
+        report: Option<GameexeDecodeReport>,
+        unknown: &mut UnknownOpRecorder,
+    ) -> Self {
+        let mut out = Self::default();
         let cfg = GameexeConfig::from_text(&text);
         out.gameexe_report = report;
         out.button_se_templates = load_button_se_templates(&cfg);
@@ -588,7 +598,6 @@ impl AssetTables {
             // for every configured index. A missing/unreadable .dbs leaves
             // that slot uninitialized; it must not shift following indices.
             out.databases = vec![None; db_cnt];
-            let database_append = crate::resource::initial_select_ini_append(project_dir);
             for i in 0..db_cnt {
                 let key = format!("DATABASE.{i}");
                 let Some(name) = cfg
@@ -608,7 +617,7 @@ impl AssetTables {
                 let dbs_file_name = format!("{name}.dbs");
                 let path = match crate::resource::resolve_dat_file_path(
                     project_dir,
-                    &database_append.dir,
+                    append,
                     &dbs_file_name,
                 ) {
                     Ok(Some(path)) => path,

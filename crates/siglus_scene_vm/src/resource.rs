@@ -982,6 +982,40 @@ pub fn find_scene_pck_path_for_append(project_dir: &Path, append_dir: &str) -> R
     )
 }
 
+pub(crate) fn load_runtime_scene_pck(
+    project_dir: &Path,
+    append: &str,
+    source: Option<&dyn crate::host::SiglusBootSource>,
+) -> Result<siglus_assets::scene_pck::ScenePck> {
+    use siglus_assets::scene_pck::ScenePck;
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    use siglus_assets::scene_pck::ScenePckDecodeOptions;
+
+    if let Some(source) = source {
+        let (bytes, options) = source.load_scene_pack(append)?;
+        return ScenePck::load_lazy_from_bytes(bytes, &options);
+    }
+
+    let path = find_scene_pck_path_for_append(project_dir, append)?;
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        let keys = load_project_key_toml(project_dir)?;
+        let options = ScenePckDecodeOptions {
+            exe_angou_element: keys
+                .as_ref()
+                .and_then(|key| key.exe_key16)
+                .map(|key| key.to_vec()),
+            easy_angou_code: Some(siglus_assets::keys::SCENE_KEY.to_vec()),
+            string_encryption_override: keys
+                .map(|key| key.override_string_encryption)
+                .unwrap_or_default(),
+        };
+        ScenePck::load_lazy_from_bytes(read_file_bytes(&path)?, &options)
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    ScenePck::load_lazy(&path, &load_scene_pck_decode_options(project_dir)?)
+}
+
 pub fn find_scene_pck_path(project_dir: &Path) -> Result<PathBuf> {
     let append = initial_select_ini_append(project_dir);
     find_scene_pck_path_for_append(project_dir, &append.dir)

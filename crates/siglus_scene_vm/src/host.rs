@@ -18,12 +18,15 @@ use siglus_assets::gameexe::{GameexeConfig, GameexeDecodeOptions, decode_gameexe
 use siglus_assets::scene_pck::{ScenePck, ScenePckDecodeOptions};
 
 use crate::render::Renderer;
+use crate::resource::SelectIniAppendEntry;
 use crate::runtime::forms::syscom as syscom_form;
 use crate::runtime::globals::{
     SyscomPendingProc, SyscomPendingProcKind, SystemMessageBoxButton, SystemMessageBoxModalState,
     WipeState,
 };
 use crate::runtime::input::{VmKey, VmMouseButton};
+use crate::runtime::tables::AssetTables;
+use crate::runtime::unknown::UnknownOpRecorder;
 use crate::runtime::wait::VmWait;
 use crate::runtime::{CommandContext, FrameCaptureBackendRef, ProcKind, native_ui};
 use crate::scene_stream::SceneStream;
@@ -210,41 +213,21 @@ pub struct SiglusHost {
     last_step: Option<Instant>,
 }
 
-fn find_scene_pck_for_host(project_dir: &Path) -> Result<PathBuf> {
-    crate::resource::find_scene_pck_path(project_dir)
+/// The startup configuration bytes and the options used to decode them.
+pub enum SiglusGameexe {
+    Ini(Vec<u8>),
+    Dat(Vec<u8>, GameexeDecodeOptions),
 }
 
-fn load_key_toml_config(
-    project_dir: &Path,
-) -> Result<Option<siglus_assets::key_toml::KeyTomlConfig>> {
-    crate::resource::load_project_key_toml(project_dir)
-}
+/// Supplies project startup files and the scene archive for each append.
+/// The append argument is empty for the base project.
+pub trait SiglusBootSource: Send + Sync {
+    fn read_gameexe(&self) -> Result<Option<SiglusGameexe>>;
+    fn load_scene_pack(&self, append: &str) -> Result<(Vec<u8>, ScenePckDecodeOptions)>;
 
-fn load_gameexe_decode_options(project_dir: &Path) -> Result<GameexeDecodeOptions> {
-    crate::resource::load_gameexe_decode_options(project_dir)
-}
-
-fn load_scene_pck_decode_options(project_dir: &Path) -> Result<ScenePckDecodeOptions> {
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    {
-        let cfg = load_key_toml_config(project_dir)?;
-        let exe = cfg
-            .as_ref()
-            .and_then(|cfg| cfg.exe_key16)
-            .map(|v| v.to_vec());
-        let string_encryption_override = cfg
-            .map(|cfg| cfg.override_string_encryption)
-            .unwrap_or_default();
-        Ok(ScenePckDecodeOptions {
-            exe_angou_element: exe,
-            easy_angou_code: Some(siglus_assets::keys::SCENE_KEY.to_vec()),
-            string_encryption_override,
-        })
-    }
-
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    {
-        crate::resource::load_scene_pck_decode_options(project_dir)
+    /// The logical directory and display name of the initial append.
+    fn initial_append(&self) -> Result<(String, String)> {
+        Ok((String::new(), String::new()))
     }
 }
 
@@ -256,24 +239,62 @@ impl SiglusHost {
     /// Synchronous constructor for native hosts which own their event loop and
     /// do not use a desktop async executor (Horizon/libnx in particular).
     pub fn new_with_renderer_sync(config: SiglusHostConfig, renderer: Renderer) -> Result<Self> {
-        Self::new_with_optional_renderer(config, Some(renderer))
+        Self::new_with_optional_renderer(config, Some(renderer), None)
     }
 
     /// Drive the VM from an embedding host which owns GPU submission.
     /// The host consumes each `RenderFrame` and the corresponding image data.
     pub fn new_external(config: SiglusHostConfig) -> Result<Self> {
-        Self::new_with_optional_renderer(config, None)
+        Self::new_with_optional_renderer(config, None, None)
+    }
+
+    pub fn new_external_with_boot_source(
+        config: SiglusHostConfig,
+        source: Arc<dyn SiglusBootSource>,
+    ) -> Result<Self> {
+        Self::new_with_optional_renderer(config, None, Some(source))
     }
 
     fn new_with_optional_renderer(
         config: SiglusHostConfig,
         renderer: Option<Renderer>,
+        source: Option<Arc<dyn SiglusBootSource>>,
     ) -> Result<Self> {
-        switch_startup_marker!(b"siglus_switch: host initial-size begin\n\0");
-        let initial_size = Self::resolve_initial_size(&config);
-        switch_startup_marker!(b"siglus_switch: host initial-size complete\n\0");
         switch_startup_marker!(b"siglus_switch: host boot-config begin\n\0");
-        let boot = Self::resolve_boot_config(&config);
+        let mut unknown = UnknownOpRecorder::default();
+        let initial_append = if let Some(source) = &source {
+            let (dir, name) = source.initial_append()?;
+            SelectIniAppendEntry { dir, name }
+        } else {
+            crate::resource::initial_select_ini_append(&config.project_dir)
+        };
+        let tables = if let Some(source) = &source {
+            match source.read_gameexe()? {
+                Some(SiglusGameexe::Ini(bytes)) => AssetTables::from_gameexe(
+                    &config.project_dir,
+                    &initial_append.dir,
+                    String::from_utf8(bytes)?,
+                    None,
+                    &mut unknown,
+                ),
+                Some(SiglusGameexe::Dat(bytes, options)) => {
+                    let (text, report) = decode_gameexe_dat_bytes(&bytes, &options)?;
+                    AssetTables::from_gameexe(
+                        &config.project_dir,
+                        &initial_append.dir,
+                        text,
+                        Some(report),
+                        &mut unknown,
+                    )
+                }
+                None => AssetTables::default(),
+            }
+        } else {
+            AssetTables::load(&config.project_dir, &mut unknown)
+        };
+        let gameexe = tables.gameexe.as_ref();
+        let initial_size = Self::resolve_initial_size(&config, gameexe);
+        let boot = Self::resolve_boot_config(&config, gameexe);
         switch_startup_marker!(b"siglus_switch: host boot-config complete\n\0");
         let mut flow = ProcFlow::default();
         flow.push(ProcType::Script, 0);
@@ -284,7 +305,15 @@ impl SiglusHost {
             .unwrap_or_else(|| "Art3m1s".to_string());
         let renderer = renderer.map(|renderer| Rc::new(RefCell::new(renderer)));
         switch_startup_marker!(b"siglus_switch: host vm-init begin\n\0");
-        let mut vm = Self::init_vm(&config, &boot, initial_size)?;
+        let mut vm = Self::init_vm(
+            &config,
+            &boot,
+            initial_size,
+            tables,
+            unknown,
+            initial_append,
+            source,
+        )?;
         switch_startup_marker!(b"siglus_switch: host vm-init complete\n\0");
         vm.ctx.globals.system.chihaya_display_adapter_name = chihaya_display_adapter_name;
         if let Some(renderer) = renderer.as_ref() {
@@ -627,9 +656,11 @@ impl SiglusHost {
         &mut self.vm
     }
 
-    fn resolve_initial_size(config: &SiglusHostConfig) -> (u32, u32) {
-        let cfg_size = Self::try_load_gameexe(&config.project_dir)
-            .as_ref()
+    fn resolve_initial_size(
+        config: &SiglusHostConfig,
+        gameexe: Option<&GameexeConfig>,
+    ) -> (u32, u32) {
+        let cfg_size = gameexe
             .and_then(Self::gameexe_screen_size)
             .unwrap_or((1280, 720));
         (
@@ -661,16 +692,13 @@ impl SiglusHost {
         Some((scene, z))
     }
 
-    fn resolve_boot_config(config: &SiglusHostConfig) -> BootConfig {
-        let cfg = Self::try_load_gameexe(&config.project_dir);
-        let (default_start, default_start_z) = cfg
-            .as_ref()
+    fn resolve_boot_config(config: &SiglusHostConfig, gameexe: Option<&GameexeConfig>) -> BootConfig {
+        let (default_start, default_start_z) = gameexe
             .and_then(|cfg| Self::gameexe_scene_entry(cfg, "START_SCENE"))
             .unwrap_or_else(|| ("_start".to_string(), 0));
         // C_tnm_ini::C_tnm_ini() defaults MENU_SCENE to "_menu" and only
         // overwrites it when Gameexe provides #MENU_SCENE.
-        let (menu_scene, menu_z) = cfg
-            .as_ref()
+        let (menu_scene, menu_z) = gameexe
             .and_then(|cfg| Self::gameexe_scene_entry(cfg, "MENU_SCENE"))
             .unwrap_or_else(|| ("_menu".to_string(), 0));
         BootConfig {
@@ -681,47 +709,22 @@ impl SiglusHost {
         }
     }
 
-    fn try_load_gameexe(project_dir: &Path) -> Option<GameexeConfig> {
-        let path = crate::resource::find_initial_gameexe_path(project_dir).ok()?;
-        let raw = crate::resource::read_file_bytes(&path).ok()?;
-        if path
-            .extension()
-            .and_then(|s| s.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("ini"))
-        {
-            let text = String::from_utf8(raw).ok()?;
-            return Some(GameexeConfig::from_text(&text));
-        }
-        let opt = load_gameexe_decode_options(project_dir).ok()?;
-        let (text, _report) = decode_gameexe_dat_bytes(&raw, &opt).ok()?;
-        Some(GameexeConfig::from_text(&text))
-    }
-
     fn init_vm(
         config: &SiglusHostConfig,
         boot: &BootConfig,
         initial_size: (u32, u32),
+        tables: AssetTables,
+        unknown: UnknownOpRecorder,
+        initial_append: SelectIniAppendEntry,
+        source: Option<Arc<dyn SiglusBootSource>>,
     ) -> Result<SceneVm<'static>> {
         let project_dir = config.project_dir.clone();
-        switch_startup_marker!(b"siglus_switch: vm scene-pck-path begin\n\0");
-        let scene_pck_path = find_scene_pck_for_host(&project_dir)?;
-        switch_startup_marker!(b"siglus_switch: vm scene-pck-path complete\n\0");
-        let opt = load_scene_pck_decode_options(&project_dir)?;
         switch_startup_marker!(b"siglus_switch: vm scene-pck-open begin\n\0");
-        let pck = {
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            {
-                let bytes = crate::resource::read_file_bytes(&scene_pck_path)
-                    .with_context(|| format!("read scene.pck: {}", scene_pck_path.display()))?;
-                ScenePck::load_lazy_from_bytes(bytes, &opt)
-                    .with_context(|| format!("open scene.pck: {}", scene_pck_path.display()))?
-            }
-            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            {
-                ScenePck::load_lazy(&scene_pck_path, &opt)
-                    .with_context(|| format!("open scene.pck: {}", scene_pck_path.display()))?
-            }
-        };
+        let pck = crate::resource::load_runtime_scene_pck(
+            &project_dir,
+            &initial_append.dir,
+            source.as_deref(),
+        )?;
         switch_startup_marker!(b"siglus_switch: vm scene-pck-open complete\n\0");
 
         let scene_no = if let Some(id) = config.scene_id {
@@ -746,7 +749,13 @@ impl SiglusHost {
         };
         stream.jump_to_z_label(start_z.max(0) as usize)?;
         switch_startup_marker!(b"siglus_switch: vm command-context begin\n\0");
-        let mut ctx = CommandContext::new(project_dir);
+        let mut ctx = CommandContext::new_with_boot_data(
+            project_dir,
+            tables,
+            unknown,
+            initial_append,
+            source,
+        );
         switch_startup_marker!(b"siglus_switch: vm command-context complete\n\0");
         let active_append = ctx.globals.append_dir.clone();
         switch_startup_marker!(b"siglus_switch: vm scene-metadata begin\n\0");

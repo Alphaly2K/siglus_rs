@@ -20,7 +20,7 @@ use crate::runtime::{
     self, CommandContext, RuntimeLoadRequest, RuntimeSaveKind, RuntimeSaveRequest, Value, constants,
 };
 use crate::scene_stream::SceneStream;
-use siglus_assets::scene_pck::{ScenePck, ScenePckDecodeOptions};
+use siglus_assets::scene_pck::ScenePck;
 
 // VM tracing is diagnostic-only. Keep the disabled path to a single cached
 // branch: the message expression is evaluated only when the trace filter
@@ -1997,40 +1997,7 @@ impl<'a> SceneVm<'a> {
         self.scene_name_resolve_cache.clear();
         self.user_cmd_resolve_cache.clear();
 
-        let scene_pck_path =
-            crate::resource::find_scene_pck_path_for_append(&self.ctx.project_dir, &active_append)?;
-
-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        {
-            let bytes = crate::resource::read_file_bytes(&scene_pck_path)?;
-            let key_cfg = ["key.toml", "Key.toml"].iter().find_map(|name| {
-                let p = self.ctx.project_dir.join(name);
-                if !crate::resource::wasm_path_is_file(&p) {
-                    return None;
-                }
-                let text = crate::resource::read_file_to_string(&p).ok()?;
-                siglus_assets::key_toml::parse_key_toml(&text).ok()
-            });
-            let exe = key_cfg
-                .as_ref()
-                .and_then(|cfg| cfg.exe_key16)
-                .map(|v| v.to_vec());
-            let string_encryption_override = key_cfg
-                .map(|cfg| cfg.override_string_encryption)
-                .unwrap_or_default();
-            let opt = ScenePckDecodeOptions {
-                exe_angou_element: exe,
-                easy_angou_code: Some(siglus_assets::keys::SCENE_KEY.to_vec()),
-                string_encryption_override,
-            };
-            self.scene_pck_cache = Some(ScenePck::load_lazy_from_bytes(bytes, &opt)?);
-        }
-
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        {
-            let opt = crate::resource::load_scene_pck_decode_options(&self.ctx.project_dir)?;
-            self.scene_pck_cache = Some(ScenePck::load_lazy(&scene_pck_path, &opt)?);
-        }
+        self.scene_pck_cache = Some(self.ctx.load_scene_pack(&active_append)?);
 
         self.ctx.install_scene_metadata(
             &active_append,
