@@ -1,6 +1,5 @@
 use crate::platform_time::Duration;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -22,6 +21,9 @@ use kira::sound::streaming::{
 
 use crate::assets::RgbaImage;
 use crate::audio::{AudioHub, TrackKind};
+use crate::resource::{GameFile, game_file_len, open_game_file, spawn_project_task};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::resource::{ProjectFiles, current_project_files, with_project_files};
 
 const MPEG2_HEADER_PROBE_BYTES: usize = 256 * 1024;
 const MPEG2_STREAM_CHUNK_BYTES: usize = 256 * 1024;
@@ -758,7 +760,7 @@ impl MovieManager {
             {
                 let (tx, rx) = mpsc::channel();
                 let worker_path = path.clone();
-                thread::spawn(move || {
+                spawn_project_task(move || {
                     lower_worker_thread_priority();
                     let result =
                         decode_asset_for_path(&worker_path).map_err(|e| format!("{:#}", e));
@@ -1005,7 +1007,7 @@ impl MovieManager {
             let cancel = Arc::new(AtomicBool::new(false));
             let worker_cancel = cancel.clone();
             let worker_path = path.to_path_buf();
-            thread::spawn(move || {
+            spawn_project_task(move || {
                 lower_worker_thread_priority();
                 let result = decode_mpeg2_audio_for_path(&worker_path, worker_cancel.as_ref())
                     .map_err(|err| format!("{:#}", err));
@@ -1196,7 +1198,7 @@ impl MovieManager {
             let cancel = Arc::new(AtomicBool::new(false));
             let worker_cancel = cancel.clone();
             let worker_path = path.to_path_buf();
-            thread::spawn(move || {
+            spawn_project_task(move || {
                 lower_worker_thread_priority();
                 let result = decode_wmv_audio_for_path(&worker_path, worker_cancel.as_ref())
                     .map_err(|err| format!("{:#}", err));
@@ -1587,7 +1589,7 @@ fn read_file_prefix(path: &Path, max_len: usize) -> Result<Vec<u8>> {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     {
         let mut file =
-            fs::File::open(path).with_context(|| format!("open file: {}", path.display()))?;
+            open_game_file(path).with_context(|| format!("open file: {}", path.display()))?;
         let mut out = vec![0u8; max_len.max(1)];
         let n = file
             .read(&mut out)
@@ -1663,7 +1665,7 @@ fn spawn_mpeg2_stream_state(
     ));
     let worker_request_frames = request_frames.clone();
     let video_path = path.clone();
-    thread::spawn(move || {
+    spawn_project_task(move || {
         lower_worker_thread_priority();
         let result = stream_mpeg2_video_worker(
             video_path.as_path(),
@@ -1714,9 +1716,8 @@ fn estimate_mpeg_video_seek_offset(
     if target_ms < 2_000 {
         return Ok(0);
     }
-    let file_len = fs::metadata(path)
-        .with_context(|| format!("stat movie file: {}", path.display()))?
-        .len();
+    let file_len =
+        game_file_len(path).with_context(|| format!("stat movie file: {}", path.display()))?;
     // Without the decoded audio track (not kept on Vita), the duration comes
     // from the last video timestamp in the file; seeking to 0 instead would
     // leave a slow decoder behind the clock for the rest of the movie.
@@ -1748,7 +1749,7 @@ fn estimate_mpeg_video_seek_offset(
     let region_end = proportional
         .saturating_add(MPEG_VIDEO_SEEK_FORWARD_PROBE_BYTES)
         .min(file_len);
-    let mut file = fs::File::open(path)
+    let mut file = open_game_file(path)
         .with_context(|| format!("open movie seek probe: {}", path.display()))?;
     file.seek(SeekFrom::Start(region_start))
         .with_context(|| format!("seek movie seek probe: {}", path.display()))?;
@@ -1830,8 +1831,8 @@ fn probe_mpeg_video_duration_ms(path: &Path) -> Option<u64> {
     const TAIL_BYTES: u64 = 1024 * 1024;
     let head = read_file_prefix(path, MPEG2_HEADER_PROBE_BYTES).ok()?;
     let first = probe_first_video_pts_90k(&head)?;
-    let mut file = fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
+    let mut file = open_game_file(path).ok()?;
+    let len = file.len().ok()?;
     let start = len.saturating_sub(TAIL_BYTES);
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut tail = Vec::new();
@@ -1901,7 +1902,7 @@ fn stream_mpeg2_video_worker(
     }
 
     let mut file =
-        fs::File::open(path).with_context(|| format!("open movie file: {}", path.display()))?;
+        open_game_file(path).with_context(|| format!("open movie file: {}", path.display()))?;
     if start_offset > 0 {
         file.seek(SeekFrom::Start(start_offset))
             .with_context(|| format!("seek movie video: {}", path.display()))?;
@@ -2266,7 +2267,7 @@ fn probe_wmv_movie_info(path: &Path) -> Result<MovieInfo> {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     let decoder = {
         let file =
-            fs::File::open(path).with_context(|| format!("open ASF/WMV: {}", path.display()))?;
+            open_game_file(path).with_context(|| format!("open ASF/WMV: {}", path.display()))?;
         wmv_decoder::AsfWmv2Decoder::open(BufReader::new(file))
             .with_context(|| format!("parse ASF/WMV: {}", path.display()))?
     };
@@ -2298,7 +2299,7 @@ fn spawn_wmv_stream_state(
     ));
     let worker_request_ms = request_ms.clone();
     let worker_path = path.clone();
-    thread::spawn(move || {
+    spawn_project_task(move || {
         lower_worker_thread_priority();
         let result = stream_wmv_video_worker(worker_path.as_path(), tx.clone(), worker_request_ms);
         if let Err(err) = result {
@@ -2333,7 +2334,7 @@ fn stream_wmv_video_worker(
     request_ms: Arc<AtomicUsize>,
 ) -> Result<()> {
     let file =
-        fs::File::open(path).with_context(|| format!("open WMV movie file: {}", path.display()))?;
+        open_game_file(path).with_context(|| format!("open WMV movie file: {}", path.display()))?;
     let mut decoder = wmv_decoder::AsfWmv2Decoder::open(BufReader::new(file))
         .with_context(|| format!("open WMV video decoder: {}", path.display()))?;
     let info = decoder.video_stream_info().clone();
@@ -2575,7 +2576,7 @@ fn spawn_omv_stream_state(path: PathBuf) -> Result<OmvStreamState> {
     let (tx, rx) = mpsc::sync_channel(OMV_STREAM_CHANNEL_CAPACITY);
     let request_frame = Arc::new(AtomicUsize::new(0));
     let worker_request_frame = request_frame.clone();
-    thread::spawn(move || {
+    spawn_project_task(move || {
         lower_worker_thread_priority();
         let result = stream_omv_video_worker(path.as_path(), tx.clone(), worker_request_frame);
         if let Err(err) = result {
@@ -2605,15 +2606,26 @@ fn spawn_omv_stream_state(path: PathBuf) -> Result<OmvStreamState> {
     })
 }
 
+fn read_omv_index(path: &Path) -> Result<siglus_assets::omv::OmvFile> {
+    let file = open_game_file(path)?;
+    let size = file.len()?;
+    siglus_assets::omv::OmvFile::read_index(file, size)
+}
+
+fn open_omv_ogg(path: &Path, omv: &siglus_assets::omv::OmvFile) -> Result<BufReader<GameFile>> {
+    let mut file = open_game_file(path)?;
+    file.seek(SeekFrom::Start(omv.ogg_data_offset))?;
+    Ok(BufReader::new(file))
+}
+
 fn stream_omv_video_worker(
     path: &Path,
     tx: mpsc::SyncSender<Result<OmvStreamEvent, String>>,
     request_frame: Arc<AtomicUsize>,
 ) -> Result<()> {
-    let omv = siglus_assets::omv::OmvFile::open(path)
-        .with_context(|| format!("open OMV index: {}", path.display()))?;
-    let reader = omv
-        .open_embedded_ogg_reader(path)
+    let omv =
+        read_omv_index(path).with_context(|| format!("open OMV index: {}", path.display()))?;
+    let reader = open_omv_ogg(path, &omv)
         .with_context(|| format!("open embedded Ogg stream: {}", path.display()))?;
     let mut video_tf = siglus_omv_decoder::TheoraVideoStream::open(reader)
         .with_context(|| format!("open streaming Theora decoder: {}", path.display()))?;
@@ -2705,7 +2717,7 @@ fn stream_omv_video_worker(
                         target_frame,
                         index_err
                     );
-                    let reader = omv.open_embedded_ogg_reader(path).with_context(|| {
+                    let reader = open_omv_ogg(path, &omv).with_context(|| {
                         format!("reopen embedded Ogg stream: {}", path.display())
                     })?;
                     let mut restarted = siglus_omv_decoder::TheoraVideoStream::open(reader)
@@ -2911,9 +2923,8 @@ impl OmvFramePool {
     /// A frame nothing but the pool holds any more. The other released
     /// frames are freed, so no more memory is kept than before.
     fn take(&mut self) -> Option<Arc<RgbaImage>> {
-        let unique = |frame: &Arc<RgbaImage>| {
-            Arc::strong_count(frame) == 1 && Arc::weak_count(frame) == 0
-        };
+        let unique =
+            |frame: &Arc<RgbaImage>| Arc::strong_count(frame) == 1 && Arc::weak_count(frame) == 0;
         let index = self.sent.iter().position(unique)?;
         let frame = self.sent.remove(index);
         self.sent.retain(|frame| !unique(frame));
@@ -3324,7 +3335,8 @@ const WMV_AUDIO_DECODE_FRAMES: usize = 4096;
 struct WmvMovieAudioDecoder {
     info: WmvStreamAudio,
     sample_rate: u32,
-    decoder: wmv_decoder::AsfWmaDecoder<BufReader<fs::File>>,
+    files: Option<ProjectFiles>,
+    decoder: wmv_decoder::AsfWmaDecoder<BufReader<GameFile>>,
     pending: VecDeque<Frame>,
     initial_silence_remaining: usize,
     source_skip_remaining: usize,
@@ -3344,6 +3356,7 @@ impl WmvMovieAudioDecoder {
         Ok(Self {
             info,
             sample_rate,
+            files: current_project_files(),
             decoder,
             pending: VecDeque::new(),
             initial_silence_remaining,
@@ -3353,15 +3366,17 @@ impl WmvMovieAudioDecoder {
         })
     }
 
-    fn open_decoder(path: &Path) -> Result<wmv_decoder::AsfWmaDecoder<BufReader<fs::File>>> {
-        let file = fs::File::open(path)
+    fn open_decoder(path: &Path) -> Result<wmv_decoder::AsfWmaDecoder<BufReader<GameFile>>> {
+        let file = open_game_file(path)
             .with_context(|| format!("open WMV movie audio: {}", path.display()))?;
         wmv_decoder::AsfWmaDecoder::open(BufReader::new(file))
             .with_context(|| format!("open WMA decoder: {}", path.display()))
     }
 
     fn reset(&mut self) -> Result<()> {
-        self.decoder = Self::open_decoder(self.info.path.as_ref())?;
+        self.decoder = with_project_files(self.files.clone(), || {
+            Self::open_decoder(self.info.path.as_ref())
+        })?;
         self.pending.clear();
         self.initial_silence_remaining = self.info.initial_silence_frames;
         self.source_skip_remaining = self.info.source_skip_frames;
@@ -3482,7 +3497,8 @@ const MPEG_AUDIO_DECODE_FRAMES: usize = 4096;
 struct MpegMovieAudioDecoder {
     info: MpegStreamAudio,
     sample_rate: u32,
-    file: fs::File,
+    files: Option<ProjectFiles>,
+    file: GameFile,
     pipeline: na_mpeg2_decoder::MpegAudioPipeline,
     read_buf: Vec<u8>,
     pending: VecDeque<Frame>,
@@ -3497,12 +3513,13 @@ impl MpegMovieAudioDecoder {
         if sample_rate == 0 || info.num_frames == 0 {
             bail!("invalid MPEG movie audio stream description");
         }
-        let file = fs::File::open(info.path.as_ref())
+        let file = open_game_file(info.path.as_ref())
             .with_context(|| format!("open MPEG movie audio: {}", info.path.display()))?;
         let initial_silence_frames = mpeg_initial_silence_frames(&info, sample_rate);
         Ok(Self {
             info,
             sample_rate,
+            files: current_project_files(),
             file,
             pipeline: na_mpeg2_decoder::MpegAudioPipeline::new(),
             read_buf: vec![0u8; MPEG2_STREAM_CHUNK_BYTES],
@@ -3518,8 +3535,10 @@ impl MpegMovieAudioDecoder {
     }
 
     fn reset_at_offset(&mut self, offset: u64, produced_frames: usize) -> Result<()> {
-        self.file = fs::File::open(self.info.path.as_ref())
-            .with_context(|| format!("reopen MPEG movie audio: {}", self.info.path.display()))?;
+        self.file = with_project_files(self.files.clone(), || {
+            open_game_file(self.info.path.as_ref())
+        })
+        .with_context(|| format!("reopen MPEG movie audio: {}", self.info.path.display()))?;
         if offset > 0 {
             self.file
                 .seek(SeekFrom::Start(offset))
@@ -3734,10 +3753,9 @@ fn align_mpeg_container_seek(path: &Path, offset: u64, transport_stream: bool) -
         return Ok(offset - offset % 188);
     }
 
-    let file_len = fs::metadata(path)
-        .with_context(|| format!("stat MPEG seek source: {}", path.display()))?
-        .len();
-    let mut file = fs::File::open(path)
+    let file_len = game_file_len(path)
+        .with_context(|| format!("stat MPEG seek source: {}", path.display()))?;
+    let mut file = open_game_file(path)
         .with_context(|| format!("open MPEG seek source: {}", path.display()))?;
     file.seek(SeekFrom::Start(offset))
         .with_context(|| format!("seek MPEG source: {}", path.display()))?;
@@ -3857,7 +3875,7 @@ fn read_omv_header_for_path(path: &Path) -> Result<siglus_assets::omv::OmvHeader
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn read_omv_header_for_path(path: &Path) -> Result<siglus_assets::omv::OmvHeader> {
-    siglus_assets::omv::OmvFile::read_header(path)
+    read_omv_header_from_bytes(&read_file_prefix(path, 0x58)?)
 }
 
 fn read_omv_header_from_bytes(buf: &[u8]) -> Result<siglus_assets::omv::OmvHeader> {
@@ -4277,7 +4295,7 @@ fn probe_wmv_first_video_pts_ms(path: &Path) -> Result<Option<u64>> {
     };
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     let mut decoder = {
-        let file = fs::File::open(path)
+        let file = open_game_file(path)
             .with_context(|| format!("open WMV timeline probe: {}", path.display()))?;
         wmv_decoder::AsfWmv2Decoder::open(BufReader::new(file))
             .with_context(|| format!("open WMV timeline probe decoder: {}", path.display()))?
@@ -4298,7 +4316,7 @@ fn decode_wmv_preview_frame(path: &Path) -> Result<Arc<RgbaImage>> {
     };
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     let mut decoder = {
-        let file = fs::File::open(path)
+        let file = open_game_file(path)
             .with_context(|| format!("open WMV preview: {}", path.display()))?;
         wmv_decoder::AsfWmv2Decoder::open(BufReader::new(file))
             .with_context(|| format!("open WMV preview decoder: {}", path.display()))?
@@ -4326,7 +4344,7 @@ fn decode_mpeg2_preview_frame(path: &Path) -> Result<Arc<RgbaImage>> {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     {
         let mut file =
-            fs::File::open(path).with_context(|| format!("open movie file: {}", path.display()))?;
+            open_game_file(path).with_context(|| format!("open movie file: {}", path.display()))?;
         let mut pipeline = na_mpeg2_decoder::MpegVideoPipeline::new();
         let mut first = None;
         let mut buf = vec![0u8; MPEG2_STREAM_CHUNK_BYTES];
@@ -4399,10 +4417,9 @@ fn decode_omv_preview_frame(path: &Path) -> Result<Arc<RgbaImage>> {
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     {
-        let omv = siglus_assets::omv::OmvFile::open(path)
-            .with_context(|| format!("open OMV index: {}", path.display()))?;
-        let reader = omv
-            .open_embedded_ogg_reader(path)
+        let omv =
+            read_omv_index(path).with_context(|| format!("open OMV index: {}", path.display()))?;
+        let reader = open_omv_ogg(path, &omv)
             .with_context(|| format!("open embedded Ogg stream: {}", path.display()))?;
         let mut stream = siglus_omv_decoder::TheoraVideoStream::open(reader)
             .with_context(|| format!("open streaming Theora decoder: {}", path.display()))?;
@@ -4535,7 +4552,7 @@ fn decode_wmv_audio_for_path(path: &Path, cancel: &AtomicBool) -> Result<Option<
         return Ok(None);
     }
 
-    let file = fs::File::open(path)
+    let file = open_game_file(path)
         .with_context(|| format!("open WMV audio source: {}", path.display()))?;
     let Some(mut decoder) = open_wmv_wma_decoder(BufReader::new(file))? else {
         return Ok(None);
@@ -4574,7 +4591,7 @@ fn decode_wmv_audio_for_path(path: &Path, cancel: &AtomicBool) -> Result<Option<
         // Rare malformed/streaming ASF files may omit a usable play duration. Keep
         // the old static fallback for that case because Kira requires a finite
         // `num_frames`; normal WMV files never take this full-decode path.
-        let file = fs::File::open(path)
+        let file = open_game_file(path)
             .with_context(|| format!("reopen WMV audio fallback: {}", path.display()))?;
         return decode_wmv_audio_full_from_reader(BufReader::new(file), cancel, timeline_origin_ms)
             .with_context(|| format!("decode WMA audio fallback: {}", path.display()));
@@ -4614,11 +4631,10 @@ fn decode_mpeg2_audio_for_path(path: &Path, cancel: &AtomicBool) -> Result<Optio
 
 fn quick_probe_mpeg2_stream_audio(path: &Path, cancel: &AtomicBool) -> Result<Option<MovieAudio>> {
     let mut file =
-        fs::File::open(path).with_context(|| format!("open movie file: {}", path.display()))?;
+        open_game_file(path).with_context(|| format!("open movie file: {}", path.display()))?;
     let file_len = file
-        .metadata()
-        .with_context(|| format!("stat movie file: {}", path.display()))?
-        .len();
+        .len()
+        .with_context(|| format!("stat movie file: {}", path.display()))?;
     if file_len == 0 {
         return Ok(None);
     }
@@ -4752,8 +4768,8 @@ fn decode_mpeg2_audio_full_probe_or_static(
     cancel: &AtomicBool,
 ) -> Result<Option<MovieAudio>> {
     let mut file =
-        fs::File::open(path).with_context(|| format!("open movie file: {}", path.display()))?;
-    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        open_game_file(path).with_context(|| format!("open movie file: {}", path.display()))?;
+    let file_len = file.len().unwrap_or(0);
     let mut probe = na_mpeg2_decoder::MpegAudioProbePipeline::new();
     let mut buf = vec![0u8; MPEG2_STREAM_CHUNK_BYTES];
     let mut prefix = Vec::new();
@@ -4877,7 +4893,7 @@ fn decode_mpeg2_audio_static_fallback(
 ) -> Result<Option<MovieAudio>> {
     let mut chunks = Vec::<na_mpeg2_decoder::MpegAudioF32>::new();
     let mut file =
-        fs::File::open(path).with_context(|| format!("open movie file: {}", path.display()))?;
+        open_game_file(path).with_context(|| format!("open movie file: {}", path.display()))?;
     let mut pipeline = na_mpeg2_decoder::MpegAudioPipeline::new();
     let mut buf = vec![0u8; MPEG2_STREAM_CHUNK_BYTES];
 
@@ -5119,7 +5135,7 @@ fn f32_to_i16_sample(s: f32) -> i16 {
 }
 
 fn decode_omv_asset(path: &Path) -> Result<MovieAsset> {
-    let omv = siglus_assets::omv::OmvFile::open(path).ok();
+    let omv = read_omv_index(path).ok();
     let frame = decode_omv_preview_frame(path)?;
     let fps = omv.as_ref().and_then(|m| {
         if m.header.frame_time_us != 0 {
@@ -5430,7 +5446,10 @@ fn convert_omv_planes_into(
     let dh = display_height.max(1) as usize;
     let (uv_w, uv_h) = yuv_plane_size(frame_width, frame_height, fmt);
 
-    rgba.resize(output_width.saturating_mul(output_height).saturating_mul(4), 0);
+    rgba.resize(
+        output_width.saturating_mul(output_height).saturating_mul(4),
+        0,
+    );
     // Source column of each output column, and how much of a row they
     // span: rows are then read as slices (per-pixel sampling with a division
     // and bounds checks took longer than decoding a 1080p frame).
@@ -5735,12 +5754,10 @@ mod omv_conversion_parity_tests {
             if !path.is_file() {
                 continue;
             }
-            let omv = siglus_assets::omv::OmvFile::open(path).unwrap();
+            let omv = read_omv_index(path).unwrap();
             let open = || {
-                siglus_omv_decoder::TheoraVideoStream::open(
-                    omv.open_embedded_ogg_reader(path).unwrap(),
-                )
-                .unwrap()
+                siglus_omv_decoder::TheoraVideoStream::open(open_omv_ogg(path, &omv).unwrap())
+                    .unwrap()
             };
             let (mut packed_stream, mut direct_stream) = (open(), open());
             let vinfo = packed_stream.info();

@@ -1200,7 +1200,7 @@ pub fn read_header_from_path(path: &Path) -> Result<OriginalSaveHeader> {
     {
         let mut file = crate::resource::open_game_file(path)
             .with_context(|| format!("open save header {}", path.display()))?;
-        let file_len = file.metadata()?.len() as usize;
+        let file_len = usize::try_from(file.len()?)?;
         let mut data = vec![0u8; file_len.min(SAVE_HEADER_SIZE)];
         file.read_exact(&mut data)
             .with_context(|| format!("read save header {}", path.display()))?;

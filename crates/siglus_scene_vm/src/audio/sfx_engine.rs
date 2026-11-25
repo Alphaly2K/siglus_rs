@@ -1266,7 +1266,7 @@ impl KoeEngine {
         let project_dir = self.inner.project_dir.clone();
         let append_dir = current_append_dir.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        crate::resource::spawn_project_task(move || {
             let result = decode_koe_no_for_project(&project_dir, koe_no)
                 .and_then(|wav| crate::audio::jitan::convert_koe_wav(wav, jitan_rate))
                 .map_err(|err| format!("{err:#}"));

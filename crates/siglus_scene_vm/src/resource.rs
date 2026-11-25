@@ -27,7 +27,7 @@ pub trait SiglusResourceSource: Send + Sync {
     fn read_range(&self, key: &str, offset: u64, output: &mut [u8]) -> Result<usize>;
 }
 
-type ProjectFiles = (PathBuf, Arc<dyn SiglusResourceSource>);
+pub(crate) type ProjectFiles = (PathBuf, Arc<dyn SiglusResourceSource>);
 thread_local! {
     static PROJECT_FILES: std::cell::RefCell<Option<ProjectFiles>> = const {
         std::cell::RefCell::new(None)
@@ -47,11 +47,20 @@ pub fn with_project_files<T>(files: Option<ProjectFiles>, run: impl FnOnce() -> 
     run()
 }
 
+pub(crate) fn current_project_files() -> Option<ProjectFiles> {
+    PROJECT_FILES.with(|files| files.borrow().clone())
+}
+
+pub(crate) fn spawn_project_task(run: impl FnOnce() + Send + 'static) {
+    let files = current_project_files();
+    std::thread::spawn(move || with_project_files(files, run));
+}
+
 fn with_project_file<T>(
     path: &Path,
-    run: impl FnOnce(&dyn SiglusResourceSource, &str) -> Result<T>,
+    run: impl FnOnce(&Arc<dyn SiglusResourceSource>, &str) -> Result<T>,
 ) -> Option<Result<T>> {
-    let (root, source) = PROJECT_FILES.with(|files| files.borrow().clone())?;
+    let (root, source) = current_project_files()?;
     Some((|| {
         let path = path.strip_prefix(root)?;
         let mut parts = Vec::new();
@@ -67,7 +76,7 @@ fn with_project_file<T>(
             }
             parts.push(name);
         }
-        run(source.as_ref(), &parts.join("/"))
+        run(&source, &parts.join("/"))
     })())
 }
 
@@ -629,20 +638,101 @@ pub fn game_file_exists(path: &Path) -> bool {
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn open_game_file(path: &Path) -> Result<fs::File> {
+pub(crate) enum GameFile {
+    Disk(fs::File),
+    Host(HostFile),
+}
+
+pub(crate) struct HostFile {
+    source: Arc<dyn SiglusResourceSource>,
+    key: String,
+    len: u64,
+    position: u64,
+}
+
+impl GameFile {
+    pub(crate) fn len(&self) -> std::io::Result<u64> {
+        match self {
+            Self::Disk(file) => Ok(file.metadata()?.len()),
+            Self::Host(file) => Ok(file.len),
+        }
+    }
+}
+
+impl std::io::Read for GameFile {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        let file = match self {
+            Self::Disk(file) => return file.read(output),
+            Self::Host(file) => file,
+        };
+        let limit = file
+            .len
+            .saturating_sub(file.position)
+            .min(output.len() as u64) as usize;
+        let mut total = 0;
+        while total < limit {
+            let count = file
+                .source
+                .read_range(&file.key, file.position, &mut output[total..limit])
+                .map_err(|error| std::io::Error::other(format!("{error:#}")))?;
+            if count == 0 || count > limit - total {
+                return Err(std::io::Error::other("invalid project file read length"));
+            }
+            file.position += count as u64;
+            total += count;
+        }
+        Ok(total)
+    }
+}
+
+impl std::io::Seek for GameFile {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        use std::io::SeekFrom;
+        let file = match self {
+            Self::Disk(file) => return file.seek(to),
+            Self::Host(file) => file,
+        };
+        let position = match to {
+            SeekFrom::Start(position) => Some(position),
+            SeekFrom::End(offset) => file.len.checked_add_signed(offset),
+            SeekFrom::Current(offset) => file.position.checked_add_signed(offset),
+        };
+        file.position = position.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid project file seek",
+            )
+        })?;
+        Ok(file.position)
+    }
+}
+
+pub(crate) fn open_game_file(path: &Path) -> Result<GameFile> {
+    if let Some(file) = with_project_file(path, |source, key| {
+        let len = source
+            .query_size(key)?
+            .ok_or_else(|| anyhow::anyhow!("missing project resource: {key}"))?;
+        Ok(GameFile::Host(HostFile {
+            source: source.clone(),
+            key: key.into(),
+            len,
+            position: 0,
+        }))
+    }) {
+        return file;
+    }
     let Some(resolved) = resolve_windows_case_insensitive_file(path)? else {
         bail!("file not found: {}", path.display());
     };
     match fs::File::open(&resolved) {
-        Ok(file) => Ok(file),
+        Ok(file) => Ok(GameFile::Disk(file)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             invalidate_game_path_cache(path);
             invalidate_game_path_cache(&resolved);
             let Some(re_resolved) = resolve_windows_case_insensitive_file(path)? else {
                 bail!("file not found: {}", path.display());
             };
-            Ok(fs::File::open(re_resolved)?)
+            Ok(GameFile::Disk(fs::File::open(re_resolved)?))
         }
         Err(err) => Err(err.into()),
     }
