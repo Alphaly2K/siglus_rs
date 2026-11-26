@@ -1127,6 +1127,17 @@ impl<'a> OriginalStreamReader<'a> {
 }
 
 pub fn save_dir(project_dir: &Path) -> PathBuf {
+    #[cfg(any(feature="nfs",feature="smb"))]
+    if let Ok(Some(user))=game_network::fs::user_root(project_dir) {return user;}
+    #[cfg(target_os = "horizon")]
+    {
+        // An embedded game payload mounts its RomFS read-only, so saves must
+        // live on the SD card. Reuse the runtime's SD layout so a game keeps
+        // its saves whether it is deployed as loose files or packed in an NSP.
+        if project_dir.to_string_lossy().starts_with("romfs:") {
+            return PathBuf::from("sdmc:/switch/siglus_rs/game/savedata");
+        }
+    }
     project_dir.join("savedata")
 }
 
@@ -1890,12 +1901,8 @@ mod local_layout_tests {
         // A missing byte in either stream must not trigger a fallback to a
         // different header and report a misleading LZSS error.
         fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
-        assert!(
-            read_local_save_file(&path)
-                .unwrap_err()
-                .to_string()
-                .contains("truncated local save layout")
-        );
+        let error = read_local_save_file(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("truncated local save layout"));
         fs::remove_dir_all(dir).unwrap();
     }
 

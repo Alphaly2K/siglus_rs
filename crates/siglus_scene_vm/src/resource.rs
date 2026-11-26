@@ -14,7 +14,10 @@
 
 use anyhow::{Result, bail};
 use std::collections::HashMap;
-use std::fs;
+#[cfg(any(feature="nfs", feature="smb"))]
+pub(crate) use game_network::fs;
+#[cfg(not(any(feature="nfs", feature="smb")))]
+pub(crate) use std::fs;
 #[cfg(target_os = "horizon")]
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -517,6 +520,15 @@ pub(crate) fn resolve_windows_case_insensitive_path(path: &Path) -> Result<Optio
     }) {
         return result;
     }
+    #[cfg(any(feature = "nfs", feature = "smb"))]
+    if fs::is_remote(path) {
+        return match fs::metadata(path) {
+            Ok(_) => Ok(Some(path.to_owned())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        };
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
         // `siglusFileExists` already uses the browser-side case-insensitive
@@ -569,6 +581,15 @@ pub(crate) fn resolve_windows_case_insensitive_file(path: &Path) -> Result<Optio
     if let Some(exists) = project_file_exists(path) {
         return Ok(exists?.then(|| path.to_path_buf()));
     }
+    #[cfg(any(feature = "nfs", feature = "smb"))]
+    if fs::is_remote(path) {
+        return match fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_file().then(|| path.to_owned())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        };
+    }
+
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
         return Ok(wasm_path_is_file(path).then_some(path.to_path_buf()));
@@ -838,6 +859,32 @@ fn cached_project_exe_key(project_dir: &Path) -> Option<Option<[u8; 16]>> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.get(project_dir).copied()
+}
+
+/// Console startup preflight. Inspect only resource headers, without running
+/// the potentially expensive key recovery or loading the scene package.
+#[cfg(any(target_os = "vita", target_os = "horizon"))]
+pub fn project_needs_exe_key(project_dir: &Path) -> Result<bool> {
+    use anyhow::Context;
+    use std::io::Read;
+
+    if siglus_assets::key_toml::load_key16_from_project_dir(project_dir)?.is_some() {
+        return Ok(false);
+    }
+    let scene_path = find_scene_pck_path(project_dir)?;
+    let mut scene_header = [0u8; 88];
+    std::fs::File::open(&scene_path)?
+        .read_exact(&mut scene_header)
+        .with_context(|| format!("read Scene.pck header: {}", scene_path.display()))?;
+    let game_path = find_initial_gameexe_path(project_dir)?;
+    let mut game_header = [0u8; 8];
+    if game_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dat")) {
+        std::fs::File::open(&game_path)?
+            .read_exact(&mut game_header)
+            .with_context(|| format!("read Gameexe.dat header: {}", game_path.display()))?;
+    }
+    siglus_key_recovery::resources_require_exe_key(&game_header, &scene_header)
+        .map_err(anyhow::Error::msg)
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -1685,7 +1732,7 @@ pub(crate) fn find_emote_psb_candidates(project_dir: &Path) -> Result<Vec<PathBu
         let Some(dat_dir) = resolve_windows_case_insensitive_path(&requested_dat)? else {
             continue;
         };
-        if !dat_dir.is_dir() {
+        if !fs::metadata(&dat_dir).is_ok_and(|m|m.is_dir()) {
             continue;
         }
 

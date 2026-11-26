@@ -300,6 +300,14 @@ impl AudioHub {
     }
 }
 
+#[cfg(feature = "art3m1s-host-audio")]
+impl Drop for AudioHub {
+    fn drop(&mut self) {
+        // Apply queued stop commands before the host mixer stops receiving frames.
+        self.render_host_pcm(&mut [0.0; 2]);
+    }
+}
+
 #[cfg(all(test, feature = "art3m1s-host-audio"))]
 mod host_audio_tests {
     use std::sync::Arc;

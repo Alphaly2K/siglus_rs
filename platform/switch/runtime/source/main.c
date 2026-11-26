@@ -29,6 +29,32 @@ static int16_t audio_buffers[AudioBufferCount][AudioBufferStorageFrames * 2]
     __attribute__((aligned(0x1000)));
 static bool audio_renderer_initialized;
 static bool audio_driver_initialized;
+static char player_error[0x800];
+
+/* Rust reports recoverable errors to the native shell, which keeps the
+ * message visible until the player dismisses the system dialog. */
+void siglus_switch_set_error(const char* message) {
+    snprintf(player_error, sizeof(player_error), "%s", message);
+}
+
+static void show_player_error(const char* message) {
+    const char* details = "Siglus Switch could not continue.\n\nLog: sdmc:/switch/siglus_rs/siglus_switch.log";
+    Result rc;
+    // Application errors require full application mode on current firmware.
+    // Homebrew launched as an applet must use the system variant instead.
+    if (appletGetAppletType() == AppletType_Application) {
+        ErrorApplicationConfig config;
+        rc = errorApplicationCreate(&config, message, details);
+        if (R_SUCCEEDED(rc)) rc = errorApplicationShow(&config);
+    } else {
+        ErrorSystemConfig config;
+        rc = errorSystemCreate(&config, message, details);
+        if (R_SUCCEEDED(rc)) rc = errorSystemShow(&config);
+    }
+    if (R_FAILED(rc)) {
+        fprintf(stderr, "Could not show error dialog: 0x%08x\n%s\n", rc, message);
+    }
+}
 
 /* Rust owns the existing SiglusHost/SceneVm.  libnx owns the process and
  * presentation lifetime; no desktop event loop or WGPU object is involved. */
@@ -86,10 +112,19 @@ Result __wrap_nvAddressSpaceMap(NvAddressSpace* address_space, u32 handle,
 }
 
 static const char* select_game_root(void) {
-    FILE* const scene_package = fopen("romfs:/game/Scene.pck", "rb");
-    if (scene_package != NULL) {
-        fclose(scene_package);
-        return RomfsGameRoot;
+    /* RomFS is case-sensitive while PC game data occasionally spells the
+       scene package differently; the Rust engine resolves case on its own,
+       so the shell only probes the common spellings for the root choice. */
+    static const char* const scene_packages[] = {
+        "romfs:/game/Scene.pck",
+        "romfs:/game/scene.pck",
+    };
+    for (size_t i = 0; i < sizeof(scene_packages) / sizeof(scene_packages[0]); ++i) {
+        FILE* const scene_package = fopen(scene_packages[i], "rb");
+        if (scene_package != NULL) {
+            fclose(scene_package);
+            return RomfsGameRoot;
+        }
     }
     return SdmcGameRoot;
 }
@@ -208,6 +243,10 @@ int main(void) {
     Result rc = romfsMountSelf("romfs");
     log_startup_result("romfsMountSelf", rc);
     if (R_FAILED(rc)) {
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "Could not mount the NRO resources (0x%08x). Copy the complete siglus-switch.nro again.", rc);
+        show_player_error(message);
         return 1;
     }
 
@@ -219,11 +258,10 @@ int main(void) {
                                                siglus_gpu_display_width(),
                                                siglus_gpu_display_height());
     if (engine == NULL) {
-        // A missing/corrupt GameData tree must not look like a hung black
-        // screen. Rust has already reported the resource/startup error; leave
-        // the applet cleanly so homebrew launchers can surface the failure.
         exit_audio();
         siglus_gpu_exit();
+        show_player_error(player_error[0] ? player_error :
+                          "Could not load the game. Check sdmc:/switch/siglus_rs/game/ and siglus_switch.log.");
         romfsExit();
         return 1;
     }
@@ -288,6 +326,7 @@ int main(void) {
 
     exit_audio();
     siglus_gpu_exit();
+    if (player_error[0]) show_player_error(player_error);
     romfsExit();
-    return 0;
+    return player_error[0] ? 1 : 0;
 }
