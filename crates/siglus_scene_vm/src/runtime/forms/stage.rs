@@ -373,6 +373,12 @@ fn parse_mwnd_selection_args(
     out
 }
 
+pub(crate) fn is_stage_message_print(ctx: &CommandContext, element: &[i32]) -> bool {
+    matches!(parse_target(ctx, element), Some(StageTarget::ChildItemOp { child, op, tail, .. })
+        if child == crate::runtime::forms::codes::STAGE_ELM_MWND && tail.is_empty()
+            && matches!(op as i32, constants::MWND_PRINT | constants::MWND____OVER_FLOW_PRINT))
+}
+
 fn parse_target(ctx: &CommandContext, chain: &[i32]) -> Option<StageTarget> {
     if chain.is_empty() || !is_stage_form_id(ctx, chain[0]) {
         return None;

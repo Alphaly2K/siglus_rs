@@ -467,7 +467,10 @@ impl SiglusHost {
         if self.native_messagebox_pending() {
             return Ok(false);
         }
-        if self.script_needs_pump || self.vm.ctx.wait.needs_runtime_poll() {
+        if self.script_needs_pump
+            || self.vm.ctx.wait.needs_runtime_poll()
+            || self.vm.text_translation_can_resume()
+        {
             #[cfg(target_os = "vita")]
             let start = Instant::now();
             self.pump_vm()?;

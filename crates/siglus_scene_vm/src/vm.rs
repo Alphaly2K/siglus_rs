@@ -3,6 +3,7 @@
 mod close;
 mod early_save;
 mod short_save;
+mod translation;
 use crate::original_save::NativeLocalLayout;
 mod indexed_save;
 
@@ -404,6 +405,7 @@ pub struct SceneVm<'a> {
     runtime_options: VmRuntimeOptions,
     call_flag_count: usize,
     stream: SceneStream<'a>,
+    translation: translation::Translation,
 
     pub ctx: CommandContext,
 
@@ -971,6 +973,7 @@ impl<'a> SceneVm<'a> {
             runtime_options,
             call_flag_count,
             stream,
+            translation: Default::default(),
             ctx,
             int_stack: Vec::new(),
             str_stack: Vec::new(),
@@ -1031,6 +1034,7 @@ impl<'a> SceneVm<'a> {
             runtime_options,
             call_flag_count,
             stream,
+            translation: Default::default(),
             ctx,
             int_stack: Vec::new(),
             str_stack: Vec::new(),
@@ -1065,7 +1069,7 @@ impl<'a> SceneVm<'a> {
     }
 
     pub fn is_blocked(&mut self) -> bool {
-        self.ctx.wait_poll()
+        self.translation_blocked() || self.ctx.wait_poll()
     }
 
     pub fn is_halted(&self) -> bool {
@@ -3893,6 +3897,7 @@ impl<'a> SceneVm<'a> {
         // C++ restart paths call tnm_finish_local()/tnm_reinit_local() before
         // resolving and entering the target scene.  Keep the same ordering so
         // local teardown cannot depend on the new scene having loaded already.
+        self.translation.pending = None;
         self.ctx.reset_for_scene_restart();
         let (stream, scene_no) = self.load_scene_stream(scene_name, z_no)?;
         self.stream = stream;
@@ -3939,6 +3944,7 @@ impl<'a> SceneVm<'a> {
     }
 
     fn restore_resume_point(&mut self, point: VmResumePoint<'a>) {
+        self.translation.pending = None;
         self.stream = point.stream;
         self.user_cmd_names = point.user_cmd_names;
         self.call_cmd_names = point.call_cmd_names;
@@ -4075,9 +4081,11 @@ impl<'a> SceneVm<'a> {
         // Frame-action inline callbacks bypass this outer wait guard so the
         // frame phase can run object callbacks while the main script is waiting.
         if respect_wait {
-            let blocked = self.ctx.wait_poll();
-            if blocked {
+            if self.is_blocked() {
                 return Ok(true);
+            }
+            if let Some(running) = self.resume_translation()? {
+                return Ok(running);
             }
         }
 
@@ -4597,65 +4605,35 @@ impl<'a> SceneVm<'a> {
                         &args,
                     );
                 }
-                let _ = self.ctx.take_read_flag_no_request();
-                let block_generation = self.ctx.wait.block_generation();
-                let proc_generation = self.ctx.proc_generation();
-                self.exec_command(elm, arg_list_id, ret_form, &mut args)?;
-                self.drain_runtime_save_load_requests()?;
-                if self.ctx.take_read_flag_no_request() {
-                    // SiglusCompiler's command read-flag ABI changed over
-                    // time, and old scenes can mix both forms in one scene:
-                    // KOE may continue directly with CD_POP while SELBTN later
-                    // in the same bytecode already carries a trailing i32.
-                    // SceneStream resolves the exact command boundaries by
-                    // parsing the whole scene against the monotonically
-                    // numbered read_flag_list. Never decide this from the local
-                    // bytes alone: CD_POP/FM_VOID starts 03 00 00 00 00 and can
-                    // collide with a real read_flag_no=3 on the same line.
-                    if self.stream.has_resolved_command_read_flag_layout() {
-                        if let Some(expected) = self.stream.command_read_flag_no_at_current_pc() {
-                            let read_flag_no = self.stream.pop_i32()?;
-                            if read_flag_no != expected {
-                                bail!(
-                                    "scene read-flag layout mismatch at pc=0x{:x}: expected {}, got {}",
-                                    self.stream.get_prg_cntr().saturating_sub(4),
-                                    expected,
-                                    read_flag_no
-                                );
-                            }
-                            self.ctx.submit_read_flag_no(read_flag_no);
-                        } else {
-                            self.ctx.discard_read_flag_no_request();
-                        }
-                    } else {
-                        // Do not regress scenes whose historical layout cannot
-                        // be proven by the static scan. Preserve the previous
-                        // modern-engine behavior rather than guessing legacy.
-                        let read_flag_no = self.stream.pop_i32()?;
-                        self.ctx.submit_read_flag_no(read_flag_no);
-                    }
-                }
-                if self.ctx.proc_generation() != proc_generation {
-                    return Ok(true);
-                }
-                if respect_wait
-                    && self.ctx.wait.block_generation() != block_generation
-                    && self.ctx.wait_poll()
+                if self.translation.is_configured()
+                    && let Some(text_arg) = self.print_text_argument(&elm, &args)
                 {
-                    return Ok(true);
+                    return self.resolve_translation(
+                        translation::Instruction::Print {
+                            element: elm,
+                            arg_list: arg_list_id,
+                            return_form: ret_form,
+                            args,
+                            text_arg,
+                        },
+                        respect_wait,
+                    );
                 }
+                return self.execute_decoded_command(
+                    elm,
+                    arg_list_id,
+                    ret_form,
+                    args,
+                    respect_wait,
+                );
             }
             CD_TEXT => {
-                let rf_flag_no = self.stream.pop_i32()?;
-                let text = self.pop_str()?;
-                if !crate::runtime::forms::stage::cd_text_current_mwnd(
-                    &mut self.ctx,
-                    &text,
-                    rf_flag_no as i64,
-                ) {
-                    self.ctx.ui.set_message(text);
-                }
-                self.drain_runtime_save_load_requests()?;
+                let read_flag = self.stream.pop_i32()?;
+                let source = self.pop_str()?;
+                return self.resolve_translation(
+                    translation::Instruction::Text { source, read_flag },
+                    respect_wait,
+                );
             }
             CD_NAME => {
                 let name = self.pop_str()?;
@@ -4712,6 +4690,113 @@ impl<'a> SceneVm<'a> {
         }
 
         Ok(true)
+    }
+
+    fn execute_decoded_command(
+        &mut self,
+        elm: Vec<i32>,
+        arg_list_id: i32,
+        ret_form: i32,
+        mut args: Vec<Value>,
+        respect_wait: bool,
+    ) -> Result<bool> {
+        let _ = self.ctx.take_read_flag_no_request();
+        let block_generation = self.ctx.wait.block_generation();
+        let proc_generation = self.ctx.proc_generation();
+        self.exec_command(elm, arg_list_id, ret_form, &mut args)?;
+        self.drain_runtime_save_load_requests()?;
+        if self.ctx.take_read_flag_no_request() {
+            // SiglusCompiler's command read-flag ABI changed over
+            // time, and old scenes can mix both forms in one scene:
+            // KOE may continue directly with CD_POP while SELBTN later
+            // in the same bytecode already carries a trailing i32.
+            // SceneStream resolves the exact command boundaries by
+            // parsing the whole scene against the monotonically
+            // numbered read_flag_list. Never decide this from the local
+            // bytes alone: CD_POP/FM_VOID starts 03 00 00 00 00 and can
+            // collide with a real read_flag_no=3 on the same line.
+            if self.stream.has_resolved_command_read_flag_layout() {
+                if let Some(expected) = self.stream.command_read_flag_no_at_current_pc() {
+                    let read_flag_no = self.stream.pop_i32()?;
+                    if read_flag_no != expected {
+                        bail!(
+                            "scene read-flag layout mismatch at pc=0x{:x}: expected {}, got {}",
+                            self.stream.get_prg_cntr().saturating_sub(4),
+                            expected,
+                            read_flag_no
+                        );
+                    }
+                    self.ctx.submit_read_flag_no(read_flag_no);
+                } else {
+                    self.ctx.discard_read_flag_no_request();
+                }
+            } else {
+                // Do not regress scenes whose historical layout cannot
+                // be proven by the static scan. Preserve the previous
+                // modern-engine behavior rather than guessing legacy.
+                let read_flag_no = self.stream.pop_i32()?;
+                self.ctx.submit_read_flag_no(read_flag_no);
+            }
+        }
+        if self.ctx.proc_generation() != proc_generation {
+            return Ok(true);
+        }
+        if respect_wait
+            && self.ctx.wait.block_generation() != block_generation
+            && self.ctx.wait_poll()
+        {
+            return Ok(true);
+        }
+        Ok(true)
+    }
+
+    fn execute_translated(
+        &mut self,
+        instruction: translation::Instruction,
+        translation: Option<String>,
+        respect_wait: bool,
+    ) -> Result<bool> {
+        match instruction {
+            translation::Instruction::Text { source, read_flag } => {
+                let text = translation.unwrap_or(source);
+                if !crate::runtime::forms::stage::cd_text_current_mwnd(
+                    &mut self.ctx,
+                    &text,
+                    read_flag as i64,
+                ) {
+                    self.ctx.ui.set_message(text);
+                }
+                self.drain_runtime_save_load_requests()?;
+                Ok(true)
+            }
+            translation::Instruction::Print {
+                element,
+                arg_list,
+                return_form,
+                mut args,
+                text_arg,
+            } => {
+                if let Some(text) = translation {
+                    let value = &mut args[text_arg];
+                    match value {
+                        Value::NamedArg { value, .. } => **value = Value::Str(text),
+                        value => *value = Value::Str(text),
+                    }
+                }
+                self.execute_decoded_command(element, arg_list, return_form, args, respect_wait)
+            }
+        }
+    }
+
+    fn print_text_argument(&self, element: &[i32], args: &[Value]) -> Option<usize> {
+        let first_text = args.iter().position(|value| value.as_str().is_some())?;
+        let (&head, tail) = element.split_first()?;
+        use codes::elm_value::{GLOBAL_PRINT, MWND____OVER_FLOW_PRINT, MWND_PRINT};
+        let window_print = element == [codes::ELM_GLOBAL_PRINT]
+            || (head == codes::FM_GLOBAL && tail == [GLOBAL_PRINT])
+            || (head == codes::FM_MWND && matches!(tail, [MWND_PRINT | MWND____OVER_FLOW_PRINT]))
+            || crate::runtime::forms::stage::is_stage_message_print(&self.ctx, element);
+        window_print.then_some(first_text)
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -12631,6 +12716,7 @@ impl<'a> SceneVm<'a> {
         let active_call_stack =
             self.restore_saved_scene_stack(snapshot.call_stack, &snapshot.scene_name)?;
         self.stream = stream;
+        self.translation.pending = None;
         self.int_stack = snapshot.int_stack;
         self.str_stack = snapshot.str_stack;
         self.element_points = snapshot.element_points;
@@ -14197,6 +14283,44 @@ mod command_dispatch_tests {
         let chunk = Box::leak(empty_scene_chunk().into_boxed_slice());
         let stream = SceneStream::new(chunk).expect("empty scene stream");
         SceneVm::new(stream, CommandContext::new(PathBuf::from(".")))
+    }
+
+    #[test]
+    fn dialogue_instructions_apply_host_reply_once_before_message_layout() {
+        for element in [None, Some(vec![codes::ELM_GLOBAL_PRINT])] {
+            let mut code = Vec::new();
+            if element.is_some() {
+                code.push(CD_COMMAND);
+                for arg in [0, 1, codes::FM_STR, 0, codes::FM_VOID, 0] {
+                    code.extend(arg.to_le_bytes());
+                }
+            } else {
+                code.push(CD_TEXT);
+                code.extend(0i32.to_le_bytes());
+            }
+            code.push(CD_EOF);
+            let mut chunk = empty_scene_chunk();
+            chunk[8..12].copy_from_slice(&(code.len() as i32).to_le_bytes());
+            chunk.extend_from_slice(&code);
+            let stream = SceneStream::new(Box::leak(chunk.into_boxed_slice())).unwrap();
+            let mut vm = SceneVm::new(stream, CommandContext::new(PathBuf::from(".")));
+            vm.configure_text_translation(Default::default(), true);
+            if let Some(element) = element {
+                vm.push_element(element);
+            }
+            vm.push_str("原文".to_owned());
+            assert!(vm.step().unwrap());
+            let (id, source) = vm.text_translation_request().unwrap();
+            assert_eq!(source, "原文");
+            vm.consume_text_translation(id);
+            assert!(vm.is_blocked());
+            assert!(vm.step().unwrap());
+            assert!(vm.ctx.ui.message_text().is_none());
+            assert!(vm.complete_text_translation(id, Some("译文".to_owned())));
+            assert!(vm.step().unwrap());
+            assert_eq!(vm.ctx.ui.message_text(), Some("译文"));
+            assert!(!vm.complete_text_translation(id, Some("过期".to_owned())));
+        }
     }
 
     #[test]
