@@ -23,6 +23,8 @@ use crate::render_math::sprite_quad_geometry_rect;
 use crate::runtime::FrameCaptureBackend;
 
 mod emote;
+#[cfg(not(target_arch = "wasm32"))]
+pub use emote::EmoteTextureRenderer;
 mod mipmap;
 
 use crate::render_plan::*;

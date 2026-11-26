@@ -365,6 +365,120 @@ impl EmoteCompositor {
     }
 }
 
+/// Renders Siglus E-Mote object packets for a native host without a window.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct EmoteTextureRenderer {
+    compositor: EmoteCompositor,
+    queue: wgpu::Queue,
+    device: wgpu::Device,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl EmoteTextureRenderer {
+    pub fn new() -> Result<Self> {
+        pollster::block_on(async {
+            use anyhow::Context;
+            let instance = wgpu::Instance::default();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .context("no adapter for Siglus E-Mote rendering")?;
+            let (device, queue) = adapter
+                .request_device(
+                    &wgpu::DeviceDescriptor {
+                        label: Some("siglus-emote-host"),
+                        required_features: wgpu::Features::empty(),
+                        required_limits: wgpu::Limits::default(),
+                    },
+                    None,
+                )
+                .await?;
+            Ok(Self {
+                compositor: EmoteCompositor::new(&device),
+                queue,
+                device,
+            })
+        })
+    }
+
+    /// Returns tightly packed, top-down RGBA8 in the engine's object texture format.
+    /// Submit successive packet versions in order for objects that sample feedback.
+    pub fn draw(&mut self, packet: &EmoteRenderPacket) -> Result<Vec<u8>> {
+        use anyhow::{Context, ensure};
+        let limit = self.device.limits().max_texture_dimension_2d;
+        ensure!(
+            (1..=limit).contains(&packet.width) && (1..=limit).contains(&packet.height),
+            "invalid Siglus E-Mote object extent {}×{}",
+            packet.width,
+            packet.height,
+        );
+        for texture in packet.textures.values() {
+            ensure!(
+                (1..=limit).contains(&texture.width)
+                    && (1..=limit).contains(&texture.height)
+                    && texture.rgba.len() as u64
+                        == u64::from(texture.width) * u64::from(texture.height) * 4,
+                "invalid Siglus E-Mote atlas texture",
+            );
+        }
+        let mut render_packet = packet.clone();
+        render_packet.alpha_readback = false;
+        self.compositor
+            .prepare(&self.device, &self.queue, &render_packet)?;
+        let texture = self
+            .compositor
+            .texture(packet.render_id)
+            .context("missing E-Mote object target")?;
+        let row_bytes = packet.width * 4;
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let stride = row_bytes.div_ceil(alignment) * alignment;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("siglus-emote-host-readback"),
+            size: u64::from(stride) * u64::from(packet.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture._tex.as_image_copy(),
+            wgpu::ImageCopyBuffer {
+                buffer: &buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(packet.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: packet.width,
+                height: packet.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        let slice = buffer.slice(..);
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        slice.map_async(wgpu::MapMode::Read, move |mapped| {
+            let _ = send.send(mapped);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        result.recv().context("Siglus E-Mote readback callback")??;
+        let data = slice.get_mapped_range();
+        let mut rgba = Vec::with_capacity(row_bytes as usize * packet.height as usize);
+        for row in data.chunks_exact(stride as usize) {
+            rgba.extend_from_slice(&row[..row_bytes as usize]);
+        }
+        if packet.alpha_readback && !packet.has_current_hit_surface() {
+            packet.publish_hit_alpha(rgba.chunks_exact(4).map(|pixel| pixel[3]).collect());
+        }
+        Ok(rgba)
+    }
+
+    pub fn retain_objects(&mut self, ids: &HashSet<u64>) {
+        self.compositor.retain_render_ids(ids);
+    }
+}
+
 fn schedule_alpha_readback(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
